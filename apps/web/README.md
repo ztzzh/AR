@@ -1,36 +1,43 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# AR Jewelry Try-On
 
-## Getting Started
+Mobile-first Web AR prototype for bracelet try-on. The page processes camera
+frames locally in the browser, tracks the wrist with MediaPipe, and renders a
+Three.js bracelet with automatic sizing, orientation following, and depth
+occlusion.
 
-First, run the development server:
+## Requirements
+
+- Node.js 20 or newer
+- A browser with camera support
+- HTTPS for real mobile camera testing; `localhost` is allowed for development
+
+## Development
 
 ```bash
+npm install
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open [http://localhost:3000](http://localhost:3000). Camera access starts only
+after the user clicks the camera button. No camera video is uploaded by this
+prototype.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Checks
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+```bash
+npm run typecheck
+npm run lint
+npm run build
+```
 
-## Learn More
+## Scope
 
-To learn more about Next.js, take a look at the following resources:
+The current release validates the core flow: open the page, authorize the
+camera, try on a bracelet, capture or share the result, and open a purchase
+link. Merchant APIs, persistent analytics, payment, and production asset
+licensing are tracked in the repository-level `ROADMAP.md` and `TODO.md`.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+Release preparation follows the repository-level `CHANGELOG.md` and the
+QuantTide DevOps lifecycle. When `qtcloud-devops` is available, use
+`qtcloud-devops release audit` and `qtcloud-devops release publish` as the
+release entrypoints.
