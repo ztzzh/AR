@@ -6,12 +6,14 @@ This roadmap keeps the project focused on the first commercial loop:
 open page -> authorize camera -> try on bracelet -> screenshot/share -> buy
 ```
 
-## Current Release: 0.1.0
+## Current Development Baseline: 0.1.0 + Unreleased
 
 - Browser-based bracelet try-on prototype.
 - MediaPipe hand tracking with left/right hand selection.
 - Three.js 3D bracelet rendering and wrist occlusion proxy.
 - Automatic wrist-size fitting and calibration controls.
+- Per-product fitting configuration with browser-local persistence.
+- Browser-local try-on and purchase-click event counters without camera frames.
 - Screenshot, share, and purchase-link actions.
 
 ## Next: Mobile Validation
@@ -23,10 +25,10 @@ open page -> authorize camera -> try on bracelet -> screenshot/share -> buy
 
 ## Following: Web MVP
 
-- Add a stable product configuration model for anchor, scale, rotation, width,
-  opacity, z-index, and hand support.
+- Extend the product configuration model with rotation, opacity, z-index, and
+  hand support as the product API is introduced.
 - Persist product and calibration data through an API.
-- Add basic try-on and purchase-click analytics.
+- Move browser-local analytics to the persistent product API.
 - Add privacy policy, terms, asset authorization records, and deletion flows.
 - Deploy the try-on page over HTTPS with a production asset CDN.
 

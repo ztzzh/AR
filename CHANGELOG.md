@@ -28,4 +28,30 @@ and this project uses semantic versioning.
 
 ## [Unreleased]
 
+### Added
+
+- Added per-product fitting configuration with automatic-size enablement,
+  automatic fit ratio, wrist-to-palm ratio, scale bounds, manual scale, and
+  anchor offset.
+- Added automatic/manual sizing override controls in the calibration panel.
+- Added browser-local persistence for fitting configuration across reloads.
+- Added a Worker-to-main-thread hand tracking fallback for browsers that cannot
+  create or transfer resized video `ImageBitmap` frames.
+- Added user-visible retry guidance for camera, model-loading, network, and
+  tracking-runtime failures.
+- Added Vitest coverage for hand selection, wrist pose anchoring, pose
+  continuity, scale fitting, and wrist-rotation size locking.
+- Added privacy-preserving browser-local event counters for page views, camera
+  authorization, first tracking, screenshots, shares, product selection, and
+  purchase clicks.
+- Added a compact local analytics panel for selected-product try-ons,
+  screenshots, purchase clicks, authorization rate, and try-on-to-purchase rate.
+
+### Verified
+
+- `npm test`
+- `npm run typecheck`
+- `npm run lint`
+- `npm run build`
+
 Future work is tracked in `ROADMAP.md` and `TODO.md`.

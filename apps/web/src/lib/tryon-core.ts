@@ -5,6 +5,12 @@ export type HandLandmark = {
   visibility?: number;
 };
 
+export type HandLandmarkerResult = {
+  landmarks: HandLandmark[][];
+  worldLandmarks: HandLandmark[][];
+  handedness: { categoryName?: string; score?: number }[][];
+};
+
 export type Vector3 = {
   x: number;
   y: number;
@@ -12,6 +18,8 @@ export type Vector3 = {
 };
 
 export type HandednessLabel = "Left" | "Right" | "Unknown";
+
+export type WristAnchorMode = "wrist" | "palm-root";
 
 export type WristPose = {
   x: number;
@@ -30,8 +38,10 @@ export type WristPose = {
 };
 
 export type WristPoseOptions = {
+  anchorMode?: WristAnchorMode;
   anchorOffset?: number;
   sourceAspect?: number;
+  wristToPalmRatio?: number;
 };
 
 export type AutoFitStatus = "settling" | "locked" | "adapting";
@@ -42,6 +52,9 @@ export type AutoFitResult = {
 };
 
 const DEFAULT_ANCHOR_OFFSET = 0.17;
+const DEFAULT_WRIST_ANCHOR_OFFSET = 0.18;
+const LOW_LATENCY_POSITION_CUTOFF = 5.2;
+const LOW_LATENCY_POSITION_BETA = 2.8;
 
 export type WristTransform = {
   x: number;
@@ -237,8 +250,10 @@ const estimatePalmCenter = (landmarks: HandLandmark[]): Vector3 => {
 const estimateWristWidth = (
   palmLength: number,
   worldLandmarks?: HandLandmark[],
+  wristToPalmRatio = 0.74,
 ) => {
-  const fallbackRatio = 0.74;
+  const fallbackRatio = clamp(wristToPalmRatio, 0.5, 1);
+  const ratioScale = fallbackRatio / 0.74;
 
   if (worldLandmarks && worldLandmarks.length >= 18) {
     const worldProximalSpan = Math.hypot(
@@ -261,7 +276,7 @@ const estimateWristWidth = (
       worldRatioRaw <= 0.82 &&
       worldPalmLength > 0.001
     ) {
-      return palmLength * clamp(worldRatioRaw, 0.5, 0.7);
+      return palmLength * clamp(worldRatioRaw * ratioScale, 0.46, 0.82);
     }
   }
 
@@ -282,6 +297,22 @@ const resolveAnchorOffset = (
 
   return clamp(automaticOffset + manualCorrection, -0.08, 0.3);
 };
+
+const resolvePoseAnchorOffset = (
+  mode: WristAnchorMode = "wrist",
+  palmWidth: number,
+  palmLength: number,
+  configuredOffset?: number,
+) =>
+  mode === "palm-root"
+    ? resolveAnchorOffset(palmWidth, palmLength, configuredOffset)
+    : clamp(
+        DEFAULT_WRIST_ANCHOR_OFFSET +
+          (configuredOffset ?? DEFAULT_ANCHOR_OFFSET) -
+          DEFAULT_ANCHOR_OFFSET,
+        -0.3,
+        0.3,
+      );
 
 const reorthogonalize = (
   armAxis: Vector3,
@@ -337,8 +368,10 @@ export function calculateWristPose(
   const wristWidth = estimateWristWidth(
     palmLength,
     worldLandmarks,
+    options.wristToPalmRatio,
   );
-  const anchorOffset = resolveAnchorOffset(
+  const anchorOffset = resolvePoseAnchorOffset(
+    options.anchorMode,
     palmWidth,
     palmLength,
     options.anchorOffset,
@@ -467,26 +500,36 @@ export class WristPoseSmoother {
   private settledFrames = 0;
   private lastTimestamp = 0;
   private pose: WristPose | null = null;
-  private xFilter = new OneEuroFilter(1.35, 0.85);
-  private yFilter = new OneEuroFilter(1.35, 0.85);
-  private depthFilter = new OneEuroFilter(1.1, 0.32);
-  private palmWidthFilter = new OneEuroFilter(1.6, 0.45);
-  private palmLengthFilter = new OneEuroFilter(1.8, 0.55);
-  private wristWidthFilter = new OneEuroFilter(1.8, 0.55);
-  private worldPalmWidthFilter = new OneEuroFilter(1.8, 0.4);
-  private worldPalmLengthFilter = new OneEuroFilter(1.8, 0.4);
+  private xFilter = new OneEuroFilter(
+    LOW_LATENCY_POSITION_CUTOFF,
+    LOW_LATENCY_POSITION_BETA,
+  );
+  private yFilter = new OneEuroFilter(
+    LOW_LATENCY_POSITION_CUTOFF,
+    LOW_LATENCY_POSITION_BETA,
+  );
+  private depthFilter = new OneEuroFilter(2.2, 0.55);
+  private palmWidthFilter = new OneEuroFilter(2.8, 0.7);
+  private palmLengthFilter = new OneEuroFilter(2.8, 0.7);
+  private wristWidthFilter = new OneEuroFilter(2.8, 0.7);
+  private worldPalmWidthFilter = new OneEuroFilter(2.8, 0.6);
+  private worldPalmLengthFilter = new OneEuroFilter(2.8, 0.6);
   private armFilters = [
-    new OneEuroFilter(2.2, 0.28),
-    new OneEuroFilter(2.2, 0.28),
-    new OneEuroFilter(2.2, 0.28),
+    new OneEuroFilter(3.6, 0.6),
+    new OneEuroFilter(3.6, 0.6),
+    new OneEuroFilter(3.6, 0.6),
   ];
   private lateralFilters = [
-    new OneEuroFilter(2.2, 0.28),
-    new OneEuroFilter(2.2, 0.28),
-    new OneEuroFilter(2.2, 0.28),
+    new OneEuroFilter(3.6, 0.6),
+    new OneEuroFilter(3.6, 0.6),
+    new OneEuroFilter(3.6, 0.6),
   ];
 
-  update(next: WristPose, timestamp: number): WristPose | null {
+  update(
+    next: WristPose,
+    timestamp: number,
+    filterPosition = true,
+  ): WristPose | null {
     if (!this.pose) {
       this.pose = next;
       this.xFilter.seed(next.x, timestamp);
@@ -535,9 +578,12 @@ export class WristPoseSmoother {
       basis.palmNormal = vectorScale(basis.palmNormal, -1);
     }
 
+    const filteredX = this.xFilter.filter(next.x, timestamp);
+    const filteredY = this.yFilter.filter(next.y, timestamp);
+
     this.pose = {
-      x: this.xFilter.filter(next.x, timestamp),
-      y: this.yFilter.filter(next.y, timestamp),
+      x: filterPosition ? filteredX : next.x,
+      y: filterPosition ? filteredY : next.y,
       depth: this.depthFilter.filter(next.depth, timestamp),
       palmWidth: this.palmWidthFilter.filter(next.palmWidth, timestamp),
       palmLength: this.palmLengthFilter.filter(next.palmLength, timestamp),
@@ -561,7 +607,7 @@ export class WristPoseSmoother {
     return this.settledFrames >= 2 ? this.pose : null;
   }
 
-  hold(timestamp: number, maximumAge = 150): WristPose | null {
+  hold(timestamp: number, maximumAge = 240): WristPose | null {
     if (!this.pose) return null;
     if (timestamp - this.lastTimestamp > maximumAge) {
       this.reset();
@@ -587,6 +633,80 @@ export class WristPoseSmoother {
   }
 }
 
+export class WristPosePredictor {
+  private previous: { pose: WristPose; timestamp: number } | null = null;
+  private latest: { pose: WristPose; timestamp: number } | null = null;
+
+  update(pose: WristPose, timestamp: number) {
+    this.previous = this.latest;
+    this.latest = { pose, timestamp };
+  }
+
+  predict(timestamp: number, maximumLeadMs = 120): WristPose | null {
+    if (!this.latest) return null;
+
+    const elapsed = timestamp - this.latest.timestamp;
+    if (elapsed <= 0 || !this.previous) return this.latest.pose;
+
+    const sampleDuration = this.latest.timestamp - this.previous.timestamp;
+    if (sampleDuration < 8 || sampleDuration > 160) return this.latest.pose;
+
+    // Compensate for detector work as well as the interval between detections.
+    // The cap prevents a noisy frame from flinging the bracelet across screen.
+    const lead = Math.min(elapsed, maximumLeadMs) * 0.9;
+    const ratio = lead / sampleDuration;
+    return {
+      ...this.latest.pose,
+      x: this.latest.pose.x + (this.latest.pose.x - this.previous.pose.x) * ratio,
+      y: this.latest.pose.y + (this.latest.pose.y - this.previous.pose.y) * ratio,
+      depth:
+        this.latest.pose.depth +
+        (this.latest.pose.depth - this.previous.pose.depth) * ratio,
+    };
+  }
+
+  reset() {
+    this.previous = null;
+    this.latest = null;
+  }
+}
+
+export class HandCountStabilizer {
+  private static readonly windowSize = 12;
+  private stableCount = 0;
+  private samples: number[] = [];
+
+  update(rawCount: number) {
+    const nextCount = clamp(Math.round(rawCount), 0, 2);
+    this.samples.push(nextCount);
+    if (this.samples.length > HandCountStabilizer.windowSize) {
+      this.samples.shift();
+    }
+
+    if (this.samples.length < 5) return this.stableCount;
+
+    const counts = [0, 0, 0];
+    this.samples.forEach((sample) => {
+      counts[sample] += 1;
+    });
+    const winner = counts.reduce(
+      (best, count, index) => (count > counts[best] ? index : best),
+      this.stableCount,
+    );
+    const requiredVotes = Math.ceil(this.samples.length * 0.67);
+    if (winner !== this.stableCount && counts[winner] >= requiredVotes) {
+      this.stableCount = winner;
+    }
+
+    return this.stableCount;
+  }
+
+  reset() {
+    this.stableCount = 0;
+    this.samples = [];
+  }
+}
+
 const median = (values: number[]) => {
   if (values.length === 0) return 0;
   const sorted = [...values].sort((a, b) => a - b);
@@ -600,6 +720,8 @@ const angleBetween = (a: Vector3, b: Vector3) =>
   Math.acos(clamp(dot(a, b), -1, 1));
 
 export class WristScaleController {
+  private static readonly stableWindowSize = 9;
+  private static readonly stableFrameCount = 8;
   private wristWidth: number | null = null;
   private lastPose: WristPose | null = null;
   private lastTimestamp = 0;
@@ -644,18 +766,20 @@ export class WristScaleController {
       this.status = "adapting";
     } else if (!isRotating) {
       this.stableSamples.push(measurement);
-      if (this.stableSamples.length > 5) this.stableSamples.shift();
+      if (this.stableSamples.length > WristScaleController.stableWindowSize) {
+        this.stableSamples.shift();
+      }
 
       const target = median(this.stableSamples);
       const difference = target - this.wristWidth;
       const alpha = clamp(elapsed * 10, 0.12, 0.42);
       this.wristWidth += difference * alpha;
       this.status =
-        this.stableSamples.length < 4 || Math.abs(difference) < this.wristWidth * 0.018
-          ? this.stableSamples.length < 6
-            ? "settling"
-            : "locked"
-          : "adapting";
+        this.stableSamples.length < WristScaleController.stableFrameCount
+          ? "settling"
+          : Math.abs(difference) < this.wristWidth * 0.018
+            ? "locked"
+            : "adapting";
     } else {
       // A rotating hand changes projected widths even when its real size does
       // not. Keep the last stable diameter until the pose settles again.

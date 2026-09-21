@@ -5,7 +5,14 @@ import type { Vector3, WristPose } from "@/lib/tryon-core";
 type ProductAppearance = {
   tint: string;
   accent: string;
-  widthRatio?: number;
+  braceletFitRatio?: number;
+  braceletAspectRatio?: number;
+  wristProxyWidthRatio?: number;
+  rotationSmoothingEnabled?: boolean;
+  autoFitEnabled?: boolean;
+  minimumScale?: number;
+  maximumScale?: number;
+  manualScale?: number;
 };
 
 type PhysicsState = {
@@ -19,7 +26,119 @@ const clamp = (value: number, minimum: number, maximum: number) =>
 const toThreeVector = (vector: Vector3) =>
   new THREE.Vector3(vector.x, -vector.y, -vector.z).normalize();
 
-const braceletOuterDiameter = 1.128;
+const braceletMajorRadius = 0.5;
+const braceletTubeRadius = 0.064;
+const braceletInnerDiameter =
+  2 * (braceletMajorRadius - braceletTubeRadius);
+const normalizedPoseUnitsToSceneUnits = 2;
+const orientationConfidenceMinimumRatio = 0.22;
+const orientationConfidenceMaximumRatio = 0.58;
+const orientationSmoothingResponse = 12;
+const sideViewTwistUpdateFloor = 0.02;
+
+const localRightAxis = new THREE.Vector3(1, 0, 0);
+const localUpAxis = new THREE.Vector3(0, 1, 0);
+
+export const calculateOrientationConfidence = (
+  pose: Pick<WristPose, "palmWidth" | "palmLength">,
+) => {
+  const projectedPalmRatio =
+    pose.palmWidth / Math.max(pose.palmLength, 0.001);
+  const normalized = clamp(
+    (projectedPalmRatio - orientationConfidenceMinimumRatio) /
+      (orientationConfidenceMaximumRatio - orientationConfidenceMinimumRatio),
+    0,
+    1,
+  );
+  return normalized * normalized * (3 - 2 * normalized);
+};
+
+export class BraceletOrientationSmoother {
+  private readonly quaternion = new THREE.Quaternion();
+  private initialized = false;
+  private lastTimestamp = 0;
+
+  update(
+    targetQuaternion: THREE.Quaternion,
+    targetArmAxis: THREE.Vector3,
+    orientationConfidence: number,
+    timestamp: number,
+    enabled: boolean,
+  ) {
+    const arm = targetArmAxis.clone().normalize();
+    if (!enabled || !this.initialized) {
+      this.quaternion.copy(targetQuaternion);
+      this.initialized = true;
+      this.lastTimestamp = timestamp;
+      return this.quaternion;
+    }
+
+    const previousRight = localRightAxis.clone().applyQuaternion(this.quaternion);
+    const heldRight = previousRight.addScaledVector(
+      arm,
+      -previousRight.dot(arm),
+    );
+    if (heldRight.lengthSq() < 1e-6) {
+      const previousUp = localUpAxis.clone().applyQuaternion(this.quaternion);
+      previousUp.addScaledVector(arm, -previousUp.dot(arm)).normalize();
+      heldRight.crossVectors(previousUp, arm);
+    }
+    heldRight.normalize();
+    const heldUp = new THREE.Vector3().crossVectors(arm, heldRight).normalize();
+
+    const targetRight = localRightAxis
+      .clone()
+      .applyQuaternion(targetQuaternion);
+    const targetUp = localUpAxis.clone().applyQuaternion(targetQuaternion);
+    if (targetRight.dot(heldRight) + targetUp.dot(heldUp) < 0) {
+      targetRight.negate();
+      targetUp.negate();
+    }
+
+    const heldQuaternion = new THREE.Quaternion().setFromRotationMatrix(
+      new THREE.Matrix4().makeBasis(heldRight, heldUp, arm),
+    );
+    const continuousTargetQuaternion = new THREE.Quaternion().setFromRotationMatrix(
+      new THREE.Matrix4().makeBasis(targetRight, targetUp, arm),
+    );
+    const elapsed = this.lastTimestamp
+      ? clamp((timestamp - this.lastTimestamp) / 1000, 1 / 240, 0.1)
+      : 1 / 60;
+    const smoothingAlpha = 1 - Math.exp(-orientationSmoothingResponse * elapsed);
+    const confidence = clamp(orientationConfidence, 0, 1);
+    const twistUpdateWeight =
+      sideViewTwistUpdateFloor +
+      (1 - sideViewTwistUpdateFloor) * confidence * confidence;
+
+    this.quaternion.copy(
+      heldQuaternion.slerp(
+        continuousTargetQuaternion,
+        smoothingAlpha * twistUpdateWeight,
+      ),
+    );
+    this.lastTimestamp = timestamp;
+    return this.quaternion;
+  }
+
+  reset() {
+    this.quaternion.identity();
+    this.initialized = false;
+    this.lastTimestamp = 0;
+  }
+}
+
+export const calculateBraceletAutoFitScale = (
+  wristWidth: number,
+  fitRatio: number,
+) => {
+  // WristPose distances are full spans in normalized frame-height units.
+  // The orthographic camera is two scene units tall, so this is a unit
+  // conversion rather than a radius-to-diameter conversion.
+  const wristOuterWidthInScene =
+    Math.max(wristWidth, 0.02) * normalizedPoseUnitsToSceneUnits;
+  const desiredInnerDiameter = wristOuterWidthInScene * fitRatio;
+  return desiredInnerDiameter / braceletInnerDiameter;
+};
 
 export class ThreeTryOnRenderer {
   private readonly scene = new THREE.Scene();
@@ -38,7 +157,15 @@ export class ThreeTryOnRenderer {
   private readonly metalMaterial: THREE.MeshPhysicalMaterial;
   private readonly gemMaterial: THREE.MeshPhysicalMaterial;
   private readonly gemMeshes: THREE.Mesh[] = [];
-  private widthRatio = 1.04;
+  private readonly orientationSmoother = new BraceletOrientationSmoother();
+  private braceletFitRatio = 1.06;
+  private braceletAspectRatio = 0.76;
+  private wristProxyWidthRatio = 0.88;
+  private rotationSmoothingEnabled = true;
+  private autoFitEnabled = true;
+  private minimumScale = 0.08;
+  private maximumScale = 0.75;
+  private manualScale = 0.22;
   private width = 1;
   private height = 1;
 
@@ -73,6 +200,7 @@ export class ThreeTryOnRenderer {
       color: appearance.tint,
       metalness: 0.92,
       roughness: 0.18,
+      transparent: true,
       clearcoat: 0.58,
       clearcoatRoughness: 0.14,
       envMapIntensity: 1.2,
@@ -81,6 +209,7 @@ export class ThreeTryOnRenderer {
       color: appearance.accent,
       metalness: 0.18,
       roughness: 0.12,
+      transparent: true,
       transmission: 0.08,
       clearcoat: 0.95,
       clearcoatRoughness: 0.05,
@@ -88,7 +217,12 @@ export class ThreeTryOnRenderer {
     });
 
     const braceletMesh = new THREE.Mesh(
-      new THREE.TorusGeometry(0.5, 0.064, 24, 96),
+      new THREE.TorusGeometry(
+        braceletMajorRadius,
+        braceletTubeRadius,
+        24,
+        96,
+      ),
       this.metalMaterial,
     );
     braceletMesh.castShadow = false;
@@ -120,6 +254,9 @@ export class ThreeTryOnRenderer {
       colorWrite: false,
       depthWrite: true,
       depthTest: true,
+      polygonOffset: true,
+      polygonOffsetFactor: -1,
+      polygonOffsetUnits: -1,
       side: THREE.DoubleSide,
     });
     const proxy = new THREE.Mesh(
@@ -140,8 +277,12 @@ export class ThreeTryOnRenderer {
   }
 
   resize(width: number, height: number) {
-    this.width = Math.max(1, width);
-    this.height = Math.max(1, height);
+    const nextWidth = Math.max(1, width);
+    const nextHeight = Math.max(1, height);
+    if (nextWidth === this.width && nextHeight === this.height) return;
+
+    this.width = nextWidth;
+    this.height = nextHeight;
     const aspect = this.width / this.height;
     this.camera.left = -aspect;
     this.camera.right = aspect;
@@ -154,13 +295,50 @@ export class ThreeTryOnRenderer {
   setAppearance(appearance: ProductAppearance) {
     this.metalMaterial.color.set(appearance.tint);
     this.gemMaterial.color.set(appearance.accent);
-    this.widthRatio = clamp(appearance.widthRatio ?? 1.04, 0.82, 1.18);
+    this.braceletFitRatio = clamp(
+      appearance.braceletFitRatio ?? 1.06,
+      1,
+      1.15,
+    );
+    this.braceletAspectRatio = clamp(
+      appearance.braceletAspectRatio ?? 0.76,
+      0.6,
+      1,
+    );
+    this.wristProxyWidthRatio = clamp(
+      appearance.wristProxyWidthRatio ?? 0.88,
+      0.75,
+      0.95,
+    );
+    const rotationSmoothingEnabled =
+      appearance.rotationSmoothingEnabled ?? true;
+    if (rotationSmoothingEnabled !== this.rotationSmoothingEnabled) {
+      this.orientationSmoother.reset();
+    }
+    this.rotationSmoothingEnabled = rotationSmoothingEnabled;
+    this.autoFitEnabled = appearance.autoFitEnabled ?? true;
+    this.minimumScale = clamp(appearance.minimumScale ?? 0.08, 0.04, 0.45);
+    this.maximumScale = Math.max(
+      this.minimumScale + 0.01,
+      clamp(appearance.maximumScale ?? 0.75, 0.1, 1.2),
+    );
+    this.manualScale = clamp(
+      appearance.manualScale ?? 0.22,
+      this.minimumScale,
+      this.maximumScale,
+    );
   }
 
-  render(pose: WristPose | null, physics: PhysicsState, opacity: number) {
+  render(
+    pose: WristPose | null,
+    physics: PhysicsState,
+    opacity: number,
+    timestamp = performance.now(),
+  ) {
     if (!pose || pose.confidence < 0.35) {
       this.proxyGroup.visible = false;
       this.braceletGroup.visible = false;
+      this.orientationSmoother.reset();
       this.renderer.render(this.scene, this.camera);
       return;
     }
@@ -170,16 +348,29 @@ export class ThreeTryOnRenderer {
     const up = toThreeVector(pose.palmNormal);
     const arm = toThreeVector(pose.armAxis);
     const basis = new THREE.Matrix4().makeBasis(right, up, arm);
-    const quaternion = new THREE.Quaternion().setFromRotationMatrix(basis);
+    const targetQuaternion = new THREE.Quaternion().setFromRotationMatrix(basis);
+    const quaternion = this.orientationSmoother.update(
+      targetQuaternion,
+      arm,
+      calculateOrientationConfidence(pose),
+      timestamp,
+      this.rotationSmoothingEnabled,
+    );
     // Palm length follows the forearm axis and stays usable while the hand
     // rolls edge-on; transverse palm width would shrink the whole bracelet.
     const screenScale =
       pose.palmLength / Math.max(pose.worldPalmLength, 0.001);
     const metersToScene =
       Math.max(screenScale, 0.02) * 2;
-    const targetDiameter =
-      Math.max(pose.wristWidth, 0.02) * 2 * this.widthRatio;
-    const braceletScale = targetDiameter / braceletOuterDiameter;
+    const autoFitScale = calculateBraceletAutoFitScale(
+      pose.wristWidth,
+      this.braceletFitRatio,
+    );
+    const braceletScale = clamp(
+      this.autoFitEnabled ? autoFitScale : this.manualScale,
+      this.minimumScale,
+      this.maximumScale,
+    );
     const position = new THREE.Vector3(
       (pose.x - 0.5) * 2 * aspect,
       (0.5 - pose.y) * 2,
@@ -190,16 +381,24 @@ export class ThreeTryOnRenderer {
     this.proxyGroup.visible = true;
     this.proxyGroup.position.copy(position);
     this.proxyGroup.quaternion.copy(quaternion);
+    // The cylinder's height was rotated onto local Z above. The wrist basis
+    // maps local X/Y/Z to lateralAxis/palmNormal/armAxis respectively, so the
+    // proxy is wider across the wrist and thinner through the palm.
+    const wristProxyWidth = braceletScale * this.wristProxyWidthRatio;
     this.proxyGroup.scale.set(
-      braceletScale * 0.78,
-      braceletScale * 0.78,
+      wristProxyWidth,
+      wristProxyWidth * this.braceletAspectRatio,
       braceletScale * 1.1,
     );
 
     this.braceletGroup.visible = true;
     this.braceletGroup.position.copy(position);
     this.braceletGroup.quaternion.copy(quaternion);
-    this.braceletGroup.scale.setScalar(braceletScale);
+    this.braceletGroup.scale.set(
+      braceletScale,
+      braceletScale * this.braceletAspectRatio,
+      braceletScale,
+    );
     this.visualGroup.rotation.set(
       0,
       0,
@@ -209,10 +408,8 @@ export class ThreeTryOnRenderer {
       if (object instanceof THREE.Mesh && object.material) {
         const material = object.material as THREE.Material & {
           opacity?: number;
-          transparent?: boolean;
         };
         if ("opacity" in material) material.opacity = opacity;
-        if ("transparent" in material) material.transparent = opacity < 1;
       }
     });
 
@@ -222,6 +419,7 @@ export class ThreeTryOnRenderer {
   clear() {
     this.proxyGroup.visible = false;
     this.braceletGroup.visible = false;
+    this.orientationSmoother.reset();
     this.renderer.render(this.scene, this.camera);
   }
 
