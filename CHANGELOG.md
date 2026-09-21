@@ -28,6 +28,10 @@ and this project uses semantic versioning.
 - Added a compact local analytics panel for selected-product try-ons,
   screenshots, purchase clicks, authorization rate, and try-on-to-purchase rate.
 
+### Fixed
+
+- Fixed cross-platform dependency installation for Linux release runners.
+
 ### Verified
 
 - `npm test`
