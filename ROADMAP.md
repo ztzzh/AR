@@ -6,7 +6,7 @@ This roadmap keeps the project focused on the first commercial loop:
 open page -> authorize camera -> try on bracelet -> screenshot/share -> buy
 ```
 
-## Current Development Baseline: 0.1.0 + Unreleased
+## Current Release: 0.2.0
 
 - Browser-based bracelet try-on prototype.
 - MediaPipe hand tracking with left/right hand selection.

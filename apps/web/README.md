@@ -25,6 +25,7 @@ prototype.
 ## Checks
 
 ```bash
+npm test
 npm run typecheck
 npm run lint
 npm run build
@@ -40,4 +41,6 @@ licensing are tracked in the repository-level `ROADMAP.md` and `TODO.md`.
 Release preparation follows the repository-level `CHANGELOG.md` and the
 QuantTide DevOps lifecycle. When `qtcloud-devops` is available, use
 `qtcloud-devops release audit` and `qtcloud-devops release publish` as the
-release entrypoints.
+release entrypoints. In this repository, pushing a commit with a new package
+version to `main` triggers `.github/workflows/release.yml`, which creates the
+matching `ar/vX.Y.Z` tag and GitHub Release after all checks pass.

@@ -1,0 +1,107 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+
+      - name: Resolve release metadata
+        id: release
+        shell: bash
+        run: |
+          version=$(node -p "require('./apps/web/package.json').version")
+          tag="ar/v${version}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+          git fetch --tags --force
+          if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            grep -F "## [${version}] -" CHANGELOG.md
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install dependencies
+        if: steps.release.outputs.publish == 'true'
+        working-directory: apps/web
+        run: npm ci
+
+      - name: Run tests
+        if: steps.release.outputs.publish == 'true'
+        working-directory: apps/web
+        run: npm test
+
+      - name: Run type check
+        if: steps.release.outputs.publish == 'true'
+        working-directory: apps/web
+        run: npm run typecheck
+
+      - name: Run lint
+        if: steps.release.outputs.publish == 'true'
+        working-directory: apps/web
+        run: npm run lint
+
+      - name: Build production app
+        if: steps.release.outputs.publish == 'true'
+        working-directory: apps/web
+        run: npm run build
+
+      - name: Prepare release notes
+        if: steps.release.outputs.publish == 'true'
+        shell: bash
+        run: |
+          version="${{ steps.release.outputs.version }}"
+          awk -v header="## [${version}]" '
+            index($0, header) == 1 { found = 1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md > "$RUNNER_TEMP/release-notes.md"
+          test -s "$RUNNER_TEMP/release-notes.md"
+
+      - name: Create release tag
+        if: steps.release.outputs.publish == 'true'
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "Release $TAG"
+          git push origin "$TAG"
+
+      - name: Create GitHub Release
+        if: steps.release.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          gh release create "$TAG" \
+            --verify-tag \
+            --latest \
+            --title "AR Jewelry Try-On v${VERSION}" \
+            --notes-file "$RUNNER_TEMP/release-notes.md"
