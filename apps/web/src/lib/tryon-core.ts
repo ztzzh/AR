@@ -11,6 +11,11 @@ export type HandLandmarkerResult = {
   handedness: { categoryName?: string; score?: number }[][];
 };
 
+export type PoseLandmarkerResult = {
+  landmarks: HandLandmark[][];
+  worldLandmarks: HandLandmark[][];
+};
+
 export type Vector3 = {
   x: number;
   y: number;
@@ -18,6 +23,45 @@ export type Vector3 = {
 };
 
 export type HandednessLabel = "Left" | "Right" | "Unknown";
+
+/** A = Hand, B = Pose arm, C = screen fit, D = orthogonal 3D basis. */
+export type ArmAxisMode = "hand" | "pose" | "screen" | "basis";
+
+export type PoseForearmDepthMode = "3d" | "flat";
+
+export type PoseForearmAxis = {
+  rawAxis: Vector3;
+  axis: Vector3;
+  confidence: number;
+  handedness: Exclude<HandednessLabel, "Unknown">;
+  elbow: HandLandmark;
+  wrist: HandLandmark;
+};
+
+export type WristBasis = {
+  armAxis: Vector3;
+  lateralAxis: Vector3;
+  normal: Vector3;
+};
+
+export type StagePoint = {
+  x: number;
+  y: number;
+};
+
+export type ScreenSpaceWristFit = {
+  center: StagePoint;
+  left: StagePoint;
+  right: StagePoint;
+  /** Full wrist cross-section width in normalized stage-height units. */
+  wristScreenWidth: number;
+  /** Requested projected bracelet diameter in normalized stage-height units. */
+  diameter: number;
+  /** Cross-section angle in stage screen space, with +Y pointing down. */
+  angle: number;
+  stageAspect: number;
+  confidence: number;
+};
 
 export type WristAnchorMode = "wrist" | "palm-root";
 
@@ -33,6 +77,8 @@ export type WristPose = {
   armAxis: Vector3;
   lateralAxis: Vector3;
   palmNormal: Vector3;
+  /** Hand-derived confidence used only for rotation around armAxis. */
+  twistConfidence?: number;
   confidence: number;
   handedness: HandednessLabel;
 };
@@ -55,6 +101,97 @@ const DEFAULT_ANCHOR_OFFSET = 0.17;
 const DEFAULT_WRIST_ANCHOR_OFFSET = 0.18;
 const LOW_LATENCY_POSITION_CUTOFF = 5.2;
 const LOW_LATENCY_POSITION_BETA = 2.8;
+
+export function mapCameraPointToStage(
+  point: Pick<HandLandmark, "x" | "y">,
+  sourceAspect: number,
+  stageAspect: number,
+): StagePoint {
+  const safeSourceAspect = Math.max(sourceAspect, 0.1);
+  const safeStageAspect = Math.max(stageAspect, 0.1);
+  let x = point.x;
+  let y = point.y;
+
+  // This is the exact center crop produced by object-fit: cover.
+  if (safeSourceAspect > safeStageAspect) {
+    x = 0.5 + (point.x - 0.5) * (safeSourceAspect / safeStageAspect);
+  } else if (safeSourceAspect < safeStageAspect) {
+    y = 0.5 + (point.y - 0.5) * (safeStageAspect / safeSourceAspect);
+  }
+
+  return { x, y };
+}
+
+const normalizeSignedDegrees = (angle: number) =>
+  ((((angle + 180) % 360) + 360) % 360) - 180;
+
+/** Visual angle after object-fit mapping and the front-camera scaleX(-1). */
+export function calculateMirroredStageAngle(
+  from: StagePoint,
+  to: StagePoint,
+  stageAspect: number,
+) {
+  const x = -(to.x - from.x) * Math.max(stageAspect, 0.1);
+  const y = to.y - from.y;
+  if (Math.hypot(x, y) < 1e-6) return null;
+  return normalizeSignedDegrees((Math.atan2(y, x) * 180) / Math.PI);
+}
+
+/** Visual angle of a Three.js scene vector after camera Y and CSS X flips. */
+export function calculateMirroredSceneAngle(direction: Vector3) {
+  const x = -direction.x;
+  const y = -direction.y;
+  if (Math.hypot(x, y) < 1e-6) return null;
+  return normalizeSignedDegrees((Math.atan2(y, x) * 180) / Math.PI);
+}
+
+export function calculateScreenAngleError(
+  firstAngle: number | null,
+  secondAngle: number | null,
+) {
+  if (firstAngle === null || secondAngle === null) return null;
+  return Math.abs(normalizeSignedDegrees(firstAngle - secondAngle));
+}
+
+/** Smallest screen-space angle between two unoriented axes (0-90 degrees). */
+export function calculateScreenAxisAngleError(
+  firstAngle: number | null,
+  secondAngle: number | null,
+) {
+  const directedError = calculateScreenAngleError(firstAngle, secondAngle);
+  if (directedError === null) return null;
+  return Math.min(directedError, 180 - directedError);
+}
+
+/**
+ * Converts DeviceMotion proper acceleration to physical world-down in the
+ * Three.js camera frame. Device axes are fixed to the natural screen
+ * orientation, so screen rotation is removed before the camera/scene mapping.
+ */
+export function calculateWorldDownInThree(
+  accelerationIncludingGravity: Vector3,
+  screenOrientationAngle: number,
+): Vector3 | null {
+  const { x, y, z } = accelerationIncludingGravity;
+  const length = Math.hypot(x, y, z);
+  if (!Number.isFinite(length) || length < 1e-6) return null;
+
+  // A stationary sensor reports support acceleration opposite physical down.
+  const downX = -x / length;
+  const downY = -y / length;
+  const downZ = -z / length;
+  const radians = (screenOrientationAngle * Math.PI) / 180;
+  const cosine = Math.cos(radians);
+  const sine = Math.sin(radians);
+
+  // Rotate natural device axes into the current screen axes. Both the screen
+  // and Three.js use +X right and +Y up; +Z points out of the display/camera.
+  return {
+    x: downX * cosine + downY * sine,
+    y: -downX * sine + downY * cosine,
+    z: downZ,
+  };
+}
 
 export type WristTransform = {
   x: number;
@@ -247,6 +384,148 @@ const estimatePalmCenter = (landmarks: HandLandmark[]): Vector3 => {
   );
 };
 
+const buildScreenSpaceWristFit = (
+  center: StagePoint,
+  wristScreenWidth: number,
+  diameter: number,
+  angle: number,
+  stageAspect: number,
+  confidence: number,
+): ScreenSpaceWristFit => {
+  const safeStageAspect = Math.max(stageAspect, 0.1);
+  const halfWidth = wristScreenWidth / 2;
+  const normal = { x: Math.cos(angle), y: Math.sin(angle) };
+  const offset = {
+    x: (normal.x * halfWidth) / safeStageAspect,
+    y: normal.y * halfWidth,
+  };
+
+  return {
+    center: { ...center },
+    left: { x: center.x - offset.x, y: center.y - offset.y },
+    right: { x: center.x + offset.x, y: center.y + offset.y },
+    wristScreenWidth,
+    diameter,
+    angle,
+    stageAspect: safeStageAspect,
+    confidence,
+  };
+};
+
+/**
+ * C-mode fitting measurement. All vector math is performed in normalized
+ * stage-height units so X/Y distances remain comparable on non-square stages.
+ */
+export function calculateScreenSpaceWristFit(
+  pose: Pick<WristPose, "x" | "y" | "wristWidth" | "confidence">,
+  landmarks: HandLandmark[],
+  sourceAspect: number,
+  stageAspect: number,
+  braceletFitRatio: number,
+): ScreenSpaceWristFit | null {
+  if (landmarks.length < 18) return null;
+
+  const safeSourceAspect = Math.max(sourceAspect, 0.1);
+  const safeStageAspect = Math.max(stageAspect, 0.1);
+  const wrist = mapCameraPointToStage(
+    landmarks[0],
+    safeSourceAspect,
+    safeStageAspect,
+  );
+  const palmCenter = mapCameraPointToStage(
+    estimatePalmCenter(landmarks),
+    safeSourceAspect,
+    safeStageAspect,
+  );
+  const forearm = {
+    x: (palmCenter.x - wrist.x) * safeStageAspect,
+    y: palmCenter.y - wrist.y,
+  };
+  const forearmLength = Math.hypot(forearm.x, forearm.y);
+  if (forearmLength < 1e-6) return null;
+
+  const direction = {
+    x: forearm.x / forearmLength,
+    y: forearm.y / forearmLength,
+  };
+  const crossSection = { x: -direction.y, y: direction.x };
+  const angle = Math.atan2(crossSection.y, crossSection.x);
+  // object-fit: cover can enlarge source-height units when a relatively
+  // narrow source is placed into a wider stage.
+  const coverScale = Math.max(1, safeStageAspect / safeSourceAspect);
+  const wristScreenWidth = Math.max(pose.wristWidth, 0.02) * coverScale;
+  const diameter = wristScreenWidth * Math.max(braceletFitRatio, 0);
+
+  return buildScreenSpaceWristFit(
+    { x: pose.x, y: pose.y },
+    wristScreenWidth,
+    diameter,
+    angle,
+    safeStageAspect,
+    pose.confidence,
+  );
+}
+
+/** Lightweight, wrap-aware temporal smoothing dedicated to C mode. */
+export class ScreenSpaceWristFitSmoother {
+  private fit: ScreenSpaceWristFit | null = null;
+  private lastTimestamp = 0;
+
+  update(next: ScreenSpaceWristFit, timestamp: number) {
+    if (!this.fit) {
+      this.fit = next;
+      this.lastTimestamp = timestamp;
+      return this.fit;
+    }
+
+    const elapsed = this.lastTimestamp
+      ? clamp((timestamp - this.lastTimestamp) / 1000, 1 / 240, 0.1)
+      : 1 / 60;
+    const centerAlpha = 1 - Math.exp(-18 * elapsed);
+    const widthAlpha = 1 - Math.exp(-13 * elapsed);
+    const angleAlpha = 1 - Math.exp(-16 * elapsed);
+    const angleDelta = Math.atan2(
+      Math.sin(next.angle - this.fit.angle),
+      Math.cos(next.angle - this.fit.angle),
+    );
+    const center = {
+      x: this.fit.center.x + (next.center.x - this.fit.center.x) * centerAlpha,
+      y: this.fit.center.y + (next.center.y - this.fit.center.y) * centerAlpha,
+    };
+    const wristScreenWidth =
+      this.fit.wristScreenWidth +
+      (next.wristScreenWidth - this.fit.wristScreenWidth) * widthAlpha;
+    const diameter =
+      this.fit.diameter + (next.diameter - this.fit.diameter) * widthAlpha;
+    const angle = this.fit.angle + angleDelta * angleAlpha;
+
+    this.fit = buildScreenSpaceWristFit(
+      center,
+      wristScreenWidth,
+      diameter,
+      angle,
+      next.stageAspect,
+      next.confidence,
+    );
+    this.lastTimestamp = timestamp;
+    return this.fit;
+  }
+
+  hold(timestamp: number, maximumAge = 240) {
+    if (!this.fit) return null;
+    if (timestamp - this.lastTimestamp > maximumAge) {
+      this.reset();
+      return null;
+    }
+    return this.fit;
+  }
+
+  reset() {
+    this.fit = null;
+    this.lastTimestamp = 0;
+  }
+}
+
 const estimateWristWidth = (
   palmLength: number,
   worldLandmarks?: HandLandmark[],
@@ -339,6 +618,206 @@ const reorthogonalize = (
     palmNormal: normalizedNormal,
   };
 };
+
+const poseLandmarkIndices = {
+  Left: { elbow: 13, wrist: 15 },
+  Right: { elbow: 14, wrist: 16 },
+} as const;
+
+/**
+ * Resolves the Pose elbow/wrist pair belonging to the tracked hand and returns
+ * the real forearm direction in Pose world coordinates. Wrist proximity is the
+ * primary association signal because Hand Landmarker handedness can be swapped
+ * for an unmirrored camera input.
+ */
+export function calculatePoseForearmAxis(
+  result: PoseLandmarkerResult | null | undefined,
+  handWrist: HandLandmark,
+  preferredHandedness: HandednessLabel = "Unknown",
+  sourceAspect = 4 / 3,
+): PoseForearmAxis | null {
+  const landmarks = result?.landmarks[0];
+  const worldLandmarks = result?.worldLandmarks[0];
+  if (!landmarks || !worldLandmarks) return null;
+
+  const candidates = (["Left", "Right"] as const).flatMap((handedness) => {
+    const indices = poseLandmarkIndices[handedness];
+    const elbow = landmarks[indices.elbow];
+    const wrist = landmarks[indices.wrist];
+    const worldElbow = worldLandmarks[indices.elbow];
+    const worldWrist = worldLandmarks[indices.wrist];
+    if (!elbow || !wrist || !worldElbow || !worldWrist) return [];
+
+    const confidence = Math.min(
+      elbow.visibility ?? 1,
+      wrist.visibility ?? 1,
+    );
+    if (confidence < 0.35) return [];
+
+    const rawAxis = vectorFromLandmarks(worldWrist, worldElbow);
+    const axis = normalize3(rawAxis);
+    if (!axis) return [];
+
+    const wristDistance = Math.hypot(
+      (wrist.x - handWrist.x) * Math.max(sourceAspect, 0.1),
+      wrist.y - handWrist.y,
+    );
+    return [
+      {
+        rawAxis,
+        axis,
+        confidence,
+        handedness,
+        elbow,
+        wrist,
+        wristDistance,
+      },
+    ];
+  });
+  if (candidates.length === 0) return null;
+
+  candidates.sort((a, b) => {
+    const distanceDelta = a.wristDistance - b.wristDistance;
+    if (Math.abs(distanceDelta) > 0.015) return distanceDelta;
+    if (a.handedness === preferredHandedness) return -1;
+    if (b.handedness === preferredHandedness) return 1;
+    return b.confidence - a.confidence;
+  });
+  const selected = candidates[0];
+
+  // Reject a body wrist that is clearly unrelated to the selected hand. This
+  // prevents the opposite arm from driving the bracelet when one wrist leaves
+  // the frame.
+  if (selected.wristDistance > 0.28) return null;
+
+  return {
+    rawAxis: selected.rawAxis,
+    axis: selected.axis,
+    confidence: selected.confidence,
+    handedness: selected.handedness,
+    elbow: selected.elbow,
+    wrist: selected.wrist,
+  };
+}
+
+export function resolvePoseForearmDepth(
+  rawAxis: Vector3,
+  mode: PoseForearmDepthMode,
+) {
+  const selectedRawAxis =
+    mode === "flat" ? { ...rawAxis, z: 0 } : { ...rawAxis };
+  const axis = normalize3(selectedRawAxis);
+  if (!axis) return null;
+
+  return {
+    rawAxis: selectedRawAxis,
+    axis,
+    depthTiltAngle:
+      (Math.atan2(
+        selectedRawAxis.z,
+        Math.hypot(selectedRawAxis.x, selectedRawAxis.y),
+      ) *
+        180) /
+      Math.PI,
+  };
+}
+
+/**
+ * Replaces only the arm axis. Hand orientation is projected around that axis
+ * to supply twist, while position, size, and all fitting geometry stay intact.
+ */
+export function applyForearmAxisToWristPose(
+  pose: WristPose,
+  forearmAxis: Vector3,
+): WristPose | null {
+  let basis = reorthogonalize(forearmAxis, pose.lateralAxis);
+
+  // When the hand lateral axis happens to align with the forearm, use the
+  // equivalent palm-normal reference to recover the same twist.
+  if (!basis) {
+    basis = reorthogonalize(
+      forearmAxis,
+      cross(pose.palmNormal, forearmAxis),
+    );
+  }
+  if (!basis) return null;
+
+  return {
+    ...pose,
+    armAxis: basis.armAxis,
+    lateralAxis: basis.lateralAxis,
+    palmNormal: basis.palmNormal,
+    // In Pose mode, projected palm width is not a valid twist-quality signal:
+    // it collapses precisely when the user rolls the hand edge-on. The Hand
+    // landmarks still provide the lateral direction around the Pose arm axis.
+    twistConfidence: pose.confidence,
+  };
+}
+
+/**
+ * D-mode basis: Pose contributes only elbow→wrist, while Hand landmarks 5/17
+ * contribute only the transverse wrist direction. Gram-Schmidt removes every
+ * arm-axis component from that raw lateral vector before the normal is built.
+ */
+export function calculatePoseHandWristBasis(
+  forearmAxis: Vector3,
+  handWorldLandmarks: HandLandmark[] | undefined,
+): WristBasis | null {
+  if (!handWorldLandmarks || handWorldLandmarks.length < 18) return null;
+
+  const indexMcp = handWorldLandmarks[5];
+  const pinkyMcp = handWorldLandmarks[17];
+  const arm = normalize3(forearmAxis);
+  if (!arm || !indexMcp || !pinkyMcp) return null;
+
+  const lateralRaw = vectorFromLandmarks(pinkyMcp, indexMcp);
+  const lateralProjected = vectorAdd(
+    lateralRaw,
+    vectorScale(arm, -dot(lateralRaw, arm)),
+  );
+  const lateral = normalize3(lateralProjected);
+  if (!lateral) return null;
+
+  const normal = normalize3(cross(arm, lateral));
+  if (!normal) return null;
+
+  return {
+    armAxis: arm,
+    lateralAxis: lateral,
+    normal,
+  };
+}
+
+export function applyPoseHandWristBasis(
+  pose: WristPose,
+  forearmAxis: Vector3,
+  handWorldLandmarks: HandLandmark[] | undefined,
+): WristPose | null {
+  const basis = calculatePoseHandWristBasis(
+    forearmAxis,
+    handWorldLandmarks,
+  );
+  if (!basis) return null;
+
+  return {
+    ...pose,
+    armAxis: basis.armAxis,
+    lateralAxis: basis.lateralAxis,
+    palmNormal: basis.normal,
+    twistConfidence: undefined,
+  };
+}
+
+/** Maximum absolute pairwise dot product; zero is perfectly orthogonal. */
+export function calculateBasisOrthogonalityError(
+  basis: WristBasis,
+) {
+  return Math.max(
+    Math.abs(dot(basis.armAxis, basis.lateralAxis)),
+    Math.abs(dot(basis.armAxis, basis.normal)),
+    Math.abs(dot(basis.lateralAxis, basis.normal)),
+  );
+}
 
 export function calculateWristPose(
   landmarks: HandLandmark[],
@@ -599,6 +1078,7 @@ export class WristPoseSmoother {
       armAxis: basis.armAxis,
       lateralAxis: basis.lateralAxis,
       palmNormal: basis.palmNormal,
+      twistConfidence: next.twistConfidence,
       confidence: next.confidence,
       handedness: next.handedness,
     };

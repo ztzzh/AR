@@ -6,7 +6,7 @@ This roadmap keeps the project focused on the first commercial loop:
 open page -> authorize camera -> try on bracelet -> screenshot/share -> buy
 ```
 
-## Current Release: 0.2.0
+## Current Release: 0.3.0
 
 - Browser-based bracelet try-on prototype.
 - MediaPipe hand tracking with left/right hand selection.
@@ -15,6 +15,12 @@ open page -> authorize camera -> try on bracelet -> screenshot/share -> buy
 - Per-product fitting configuration with browser-local persistence.
 - Browser-local try-on and purchase-click event counters without camera frames.
 - Screenshot, share, and purchase-link actions.
+- Inner-diameter fitting, elliptical bracelet shaping, and matched wrist
+  occlusion-proxy calibration.
+- Quaternion twist stabilization with side-view confidence and an A/B switch.
+- Hand-only versus Pose elbow-wrist arm-axis A/B testing.
+- Pose-axis, forearm-angle, ring-normal-angle, and Device Motion diagnostics.
+- Pose-aligned Torus orientation with side-view twist continuity.
 
 ## Next: Mobile Validation
 

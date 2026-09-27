@@ -7,6 +7,45 @@ and this project uses semantic versioning.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-27
+
+### Added
+
+- Added inner-diameter bracelet fitting with live bracelet-fit, elliptical
+  aspect-ratio, and wrist-occlusion-proxy calibration controls.
+- Added quaternion-slerp twist stabilization with side-view confidence,
+  stable-twist holding, and a raw-orientation A/B switch.
+- Added a live Hand-only versus Pose elbow-wrist arm-axis A/B switch. The Pose
+  branch uses the same-side world-coordinate `wrist - elbow` axis while keeping
+  Hand landmarks only for twist, and performs no Pose inference in the
+  Hand-only baseline.
+- Added Pose-axis confidence/source diagnostics and an elbow-wrist debug line
+  without segmentation, geometry retuning, or new bracelet deformation.
+- Added live forearm-screen-angle, rendered ring-normal-angle, and angular-error
+  diagnostics using the same cover crop and front-camera mirror as the video.
+- Added a diagnostic-only world-down overlay from Device Motion, including
+  portrait/landscape, front-camera mirror, and Three.js coordinate conversion.
+  The panel now reports forearm-to-gravity and bracelet-normal-to-forearm axis
+  errors without applying gravity compensation to the bracelet.
+
+### Fixed
+
+- Matched the bracelet and invisible wrist proxy to the same elliptical wrist
+  cross-section to reduce side-view air gaps.
+- Made Torus local `+Z` align directly to the Pose forearm axis before applying
+  Hand-derived twist, so palm orientation can no longer tilt the ring plane.
+- Prevented Pose-mode wrist twist from freezing edge-on. Pose still owns only
+  the elbow-wrist normal, while the Hand-derived twist now uses Hand tracking
+  confidence instead of the collapsing two-dimensional palm-width ratio.
+
+### Verified
+
+- `npm test`
+- `npm run typecheck`
+- `npm run lint`
+- `npm run build`
+- `git diff --check`
+
 ## [0.2.0] - 2026-09-21
 
 ### Added

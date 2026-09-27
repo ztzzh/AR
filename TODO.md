@@ -9,6 +9,14 @@
 - [ ] Verify screenshot composition on mobile devices.
 - [x] Add a user-visible retry path for model-loading and network failures.
 - [ ] Verify Worker-to-main-thread hand tracking fallback on mobile browsers.
+- [ ] Compare Hand-only and Pose elbow-wrist arm axes on iPhone Safari and
+      Android Chrome while rotating the wrist; record side-view fit, rotation
+      jitter, Pose dropouts, inference time, and FPS.
+- [ ] In a stable side view, verify the mapped Pose forearm line follows the
+      visible arm and `Bracelet vs Forearm angle` stays near 2–5 degrees.
+- [ ] With the phone held in portrait and both landscape orientations, verify
+      the blue gravity line remains physically vertical and a real vertical
+      forearm reports `Forearm vs Gravity angle` near 0 degrees.
 
 ## `apps/web/src/lib/tryon-core.ts`
 

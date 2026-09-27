@@ -15,18 +15,34 @@ import {
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
+  applyForearmAxisToWristPose,
+  applyPoseHandWristBasis,
   type AutoFitStatus,
+  type ArmAxisMode,
   HandCountStabilizer,
   type HandLandmarkerResult,
   WristScaleController,
   BraceletPhysics,
+  calculateBasisOrthogonalityError,
+  calculatePoseForearmAxis,
+  resolvePoseForearmDepth,
+  calculateScreenSpaceWristFit,
+  calculateMirroredSceneAngle,
+  calculateMirroredStageAngle,
+  calculateScreenAxisAngleError,
+  calculateWorldDownInThree,
   calculateWristPose,
+  mapCameraPointToStage,
   projectGravityToWristPlane,
   selectPrimaryHand,
+  ScreenSpaceWristFitSmoother,
   WristPosePredictor,
   WristPoseSmoother,
   type HandednessLabel,
   type HandLandmark,
+  type PoseLandmarkerResult,
+  type PoseForearmDepthMode,
+  type ScreenSpaceWristFit,
   type Vector3,
   type WristPose,
   type WristAnchorMode,
@@ -43,7 +59,7 @@ import {
 } from "@/lib/tryon-analytics";
 import { configureMediaPipeRuntimeLogging } from "@/lib/mediapipe-runtime";
 import {
-  calculateOrientationConfidence,
+  calculateTwistConfidence,
   ThreeTryOnRenderer,
 } from "@/lib/three-tryon-renderer";
 
@@ -72,7 +88,20 @@ type ProductFitConfig = {
 type DebugFrame = {
   landmarks: HandLandmark[];
   pose: WristPose | null;
+  armAxisMode: ArmAxisMode;
+  poseElbow: HandLandmark | null;
+  poseWrist: HandLandmark | null;
+  poseConfidence: number | null;
+  poseHandedness: Exclude<HandednessLabel, "Unknown"> | null;
+  poseForearmRawAxis: Vector3 | null;
+  poseForearmDepthTiltAngle: number | null;
+  braceletNormal: Vector3 | null;
+  rotationErrorDegrees: number | null;
+  rotationAlpha: number | null;
+  rotationSmoothingEnabled: boolean | null;
+  worldGravityDown: Vector3 | null;
   orientationConfidence: number | null;
+  screenSpaceFit: ScreenSpaceWristFit | null;
   sourceAspect: number;
   stageAspect: number;
 };
@@ -94,11 +123,19 @@ type PerformanceAccumulator = {
   windowStartedAt: number;
 };
 
+type PoseModelStatus = "idle" | "loading" | "ready" | "unavailable";
+
 type HandTrackingWorkerResponse =
-  | { type: "ready" }
+  | {
+      type: "ready";
+      poseAvailable: boolean;
+      poseError?: string;
+    }
   | {
       type: "result";
       result: HandLandmarkerResult;
+      poseResult?: PoseLandmarkerResult;
+      poseError?: string;
       sessionId: number;
       timestamp: number;
       videoTime: number;
@@ -229,6 +266,8 @@ const analyticsStorageKey = "ar-jewelry:tryon-analytics:v1";
 const hydrationAnalyticsTimestamp = "1970-01-01T00:00:00.000Z";
 const handLandmarkerModelAssetPath =
   "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
+const poseLandmarkerModelAssetPath =
+  "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task";
 const mediaPipeWasmPath =
   "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision/wasm";
 const handLandmarkerOptions = {
@@ -238,6 +277,21 @@ const handLandmarkerOptions = {
   minHandPresenceConfidence: 0.55,
   minTrackingConfidence: 0.55,
 };
+
+const poseModelStatusLabels: Record<PoseModelStatus, string> = {
+  idle: "启动相机后加载",
+  loading: "正在加载 Pose Lite",
+  ready: "Pose Lite 已就绪",
+  unavailable: "Pose 不可用",
+};
+const poseLandmarkerOptions = {
+  runningMode: "VIDEO" as const,
+  numPoses: 1,
+  minPoseDetectionConfidence: 0.5,
+  minPosePresenceConfidence: 0.5,
+  minTrackingConfidence: 0.5,
+  outputSegmentationMasks: false,
+};
 const minimumInferenceIntervalMs = 1000 / 30;
 const inferenceFrameWidth = 480;
 const inferenceFrameHeight = 360;
@@ -245,6 +299,8 @@ const poseVisibilityGraceMs = 80;
 const poseVisibilityFadeMs = 160;
 const performanceUpdateIntervalMs = 1000;
 const modelLoadErrorMessage = "手部模型加载失败，请检查网络后重试。";
+const poseModelLoadErrorMessage =
+  "Pose 模型加载失败；Hand-only 仍可使用，重启相机可重试。";
 
 const emptyPerformanceStats = (): DebugPerformanceStats => ({
   inferenceMs: null,
@@ -296,6 +352,21 @@ const formatTiming = (value: number | null, digits = 1) =>
 
 const formatFps = (value: number | null) =>
   value === null ? "--" : value.toFixed(1);
+
+const formatDegrees = (value: number | null) =>
+  value === null ? "--" : `${value.toFixed(1)}°`;
+
+const formatVector3 = (vector: Vector3 | null) =>
+  vector
+    ? `${vector.x.toFixed(3)}, ${vector.y.toFixed(3)}, ${vector.z.toFixed(3)}`
+    : "--";
+
+const getScreenOrientationAngle = () => {
+  const screenAngle = window.screen.orientation?.angle;
+  if (Number.isFinite(screenAngle)) return screenAngle;
+  const legacyAngle = (window as Window & { orientation?: number }).orientation;
+  return Number.isFinite(legacyAngle) ? (legacyAngle ?? 0) : 0;
+};
 
 const getErrorText = (error: unknown, fallback: string) =>
   error instanceof Error && error.message ? error.message : fallback;
@@ -460,31 +531,8 @@ function mapPoseToStage(
   stageAspect: number,
 ) {
   if (!pose) return null;
-
-  let x = pose.x;
-  let y = pose.y;
-  if (sourceAspect > stageAspect) {
-    x = 0.5 + (pose.x - 0.5) * (sourceAspect / stageAspect);
-  } else if (sourceAspect < stageAspect) {
-    y = 0.5 + (pose.y - 0.5) * (stageAspect / sourceAspect);
-  }
-
-  return { ...pose, x, y };
-}
-
-function mapPointToStage(
-  point: HandLandmark,
-  sourceAspect: number,
-  stageAspect: number,
-) {
-  let x = point.x;
-  let y = point.y;
-  if (sourceAspect > stageAspect) {
-    x = 0.5 + (point.x - 0.5) * (sourceAspect / stageAspect);
-  } else if (sourceAspect < stageAspect) {
-    y = 0.5 + (point.y - 0.5) * (stageAspect / sourceAspect);
-  }
-  return { x, y };
+  const mapped = mapCameraPointToStage(pose, sourceAspect, stageAspect);
+  return { ...pose, ...mapped };
 }
 
 export default function Home() {
@@ -500,6 +548,14 @@ export default function Home() {
   const [calibrationOpen, setCalibrationOpen] = useState(false);
   const [physicsEnabled, setPhysicsEnabled] = useState(false);
   const [positionFilterEnabled, setPositionFilterEnabled] = useState(true);
+  const [armAxisMode, setArmAxisMode] = useState<ArmAxisMode>("hand");
+  const [poseForearmDepthMode, setPoseForearmDepthMode] =
+    useState<PoseForearmDepthMode>("3d");
+  const [basisRotationSmoothingEnabled, setBasisRotationSmoothingEnabled] =
+    useState(false);
+  const [poseModelStatus, setPoseModelStatus] =
+    useState<PoseModelStatus>("idle");
+  const [poseModelMessage, setPoseModelMessage] = useState("");
   const [productConfigs, setProductConfigs] =
     useState<Record<string, ProductFitConfig>>(() => ({
       ...defaultProductConfigs,
@@ -519,6 +575,11 @@ export default function Home() {
     detectForVideo: (video: HTMLVideoElement, timestamp: number) => HandLandmarkerResult;
     close?: () => void;
   } | null>(null);
+  const poseLandmarkerRef = useRef<{
+    detectForVideo: (video: HTMLVideoElement, timestamp: number) => PoseLandmarkerResult;
+    close?: () => void;
+  } | null>(null);
+  const poseModelAvailableRef = useRef(false);
   const handTrackingWorkerRef = useRef<Worker | null>(null);
   const workerBusyRef = useRef(false);
   const trackingSessionRef = useRef(0);
@@ -530,6 +591,7 @@ export default function Home() {
   const lastVideoTimeRef = useRef(-1);
   const lastFrameTimestampRef = useRef(0);
   const renderPoseRef = useRef<WristPose | null>(null);
+  const screenSpaceFitRef = useRef<ScreenSpaceWristFit | null>(null);
   const poseVisibleRef = useRef(false);
   const lastVisiblePoseTimestampRef = useRef(0);
   const renderedPoseRef = useRef(false);
@@ -544,19 +606,27 @@ export default function Home() {
   const calibrationOpenRef = useRef(false);
   const physicsEnabledRef = useRef(false);
   const positionFilterEnabledRef = useRef(true);
+  const armAxisModeRef = useRef<ArmAxisMode>("hand");
+  const poseForearmDepthModeRef = useRef<PoseForearmDepthMode>("3d");
+  const basisRotationSmoothingEnabledRef = useRef(false);
   const lastDebugUpdateRef = useRef(0);
+  const debugFrameSourceRef = useRef<DebugFrame | null>(null);
   const performanceAccumulatorRef = useRef(createPerformanceAccumulator());
   const performanceSnapshotRef = useRef<DebugPerformanceStats>(
     emptyPerformanceStats(),
   );
   const selectedHandRef = useRef<HandednessLabel>("Unknown");
   const poseSmootherRef = useRef(new WristPoseSmoother());
+  const screenSpaceFitSmootherRef = useRef(
+    new ScreenSpaceWristFitSmoother(),
+  );
   const posePredictorRef = useRef(new WristPosePredictor());
   const scaleControllerRef = useRef(new WristScaleController());
   const autoFitStatusRef = useRef<AutoFitStatus>("settling");
   const physicsRef = useRef(new BraceletPhysics());
   const rendererRef = useRef<ThreeTryOnRenderer | null>(null);
   const gravityRef = useRef<Vector3>(defaultGravity);
+  const worldGravityDebugRef = useRef<Vector3 | null>(null);
   const motionHandlerRef = useRef<((event: DeviceMotionEvent) => void) | null>(
     null,
   );
@@ -685,6 +755,26 @@ export default function Home() {
     setCalibrationOpen(nextOpen);
     if (nextOpen) {
       setDebugPerformance(performanceSnapshotRef.current);
+      const source = debugFrameSourceRef.current;
+      const orientationDebug =
+        rendererRef.current?.getOrientationDebug() ?? null;
+      setDebugFrame(
+        source
+            ? {
+                ...source,
+                braceletNormal: orientationDebug?.ringNormal ?? null,
+                rotationErrorDegrees:
+                  orientationDebug?.rotation?.errorDegrees ?? null,
+                rotationAlpha: orientationDebug?.rotation?.alpha ?? null,
+                rotationSmoothingEnabled:
+                  orientationDebug?.rotation?.enabled ?? null,
+                worldGravityDown: worldGravityDebugRef.current
+                  ? { ...worldGravityDebugRef.current }
+                  : null,
+                screenSpaceFit: screenSpaceFitRef.current,
+              }
+          : null,
+      );
     } else {
       setDebugFrame(null);
       lastDebugUpdateRef.current = 0;
@@ -703,6 +793,42 @@ export default function Home() {
     performanceAccumulatorRef.current = createPerformanceAccumulator();
     performanceSnapshotRef.current = emptyStats;
     setDebugPerformance(emptyStats);
+  }, []);
+
+  const selectTrackingFittingMode = useCallback(
+    (mode: ArmAxisMode) => {
+      if (armAxisModeRef.current === mode) return;
+      armAxisModeRef.current = mode;
+      setArmAxisMode(mode);
+      renderPoseRef.current = null;
+      screenSpaceFitRef.current = null;
+      poseVisibleRef.current = false;
+      lastVisiblePoseTimestampRef.current = 0;
+      renderedPoseRef.current = false;
+      poseSmootherRef.current.reset();
+      screenSpaceFitSmootherRef.current.reset();
+      posePredictorRef.current.reset();
+      physicsRef.current.reset();
+      debugFrameSourceRef.current = null;
+      setDebugFrame(null);
+      resetPerformanceStats();
+      rendererRef.current?.clear();
+    },
+    [resetPerformanceStats],
+  );
+
+  const selectPoseForearmDepthMode = useCallback(
+    (mode: PoseForearmDepthMode) => {
+      if (poseForearmDepthModeRef.current === mode) return;
+      poseForearmDepthModeRef.current = mode;
+      setPoseForearmDepthMode(mode);
+    },
+    [],
+  );
+
+  const selectBasisRotationSmoothing = useCallback((enabled: boolean) => {
+    basisRotationSmoothingEnabledRef.current = enabled;
+    setBasisRotationSmoothingEnabled(enabled);
   }, []);
 
   const publishPerformanceStats = useCallback((timestamp: number) => {
@@ -763,14 +889,17 @@ export default function Home() {
       recordAnalytics("tracking_error", { errorKind: recoveryKind });
       updateDetectedHands(0);
       poseSmootherRef.current.reset();
+      screenSpaceFitSmootherRef.current.reset();
       posePredictorRef.current.reset();
       scaleControllerRef.current.reset();
       updateAutoFitStatus("settling");
       physicsRef.current.reset();
       renderPoseRef.current = null;
+      screenSpaceFitRef.current = null;
       poseVisibleRef.current = false;
       lastVisiblePoseTimestampRef.current = 0;
       renderedPoseRef.current = false;
+      debugFrameSourceRef.current = null;
       setDebugFrame(null);
       resetPerformanceStats();
       rendererRef.current?.clear();
@@ -809,7 +938,12 @@ export default function Home() {
   );
 
   const processDetectionResult = useCallback(
-    (result: HandLandmarkerResult, timestamp: number, videoTime: number) => {
+    (
+      result: HandLandmarkerResult,
+      timestamp: number,
+      videoTime: number,
+      poseResult?: PoseLandmarkerResult,
+    ) => {
       const video = videoRef.current;
       if (!video) return;
 
@@ -833,7 +967,22 @@ export default function Home() {
         category === "Left" || category === "Right" ? category : "Unknown";
       const sourceAspect =
         (video.videoWidth || 4) / (video.videoHeight || 3);
-      const rawPose = selectedLandmarks
+      const selectedPoseForearm = selectedLandmarks
+        ? calculatePoseForearmAxis(
+            poseResult,
+            selectedLandmarks[0],
+            handedness,
+            sourceAspect,
+          )
+        : null;
+      const dPoseForearm =
+        armAxisModeRef.current === "basis" && selectedPoseForearm
+          ? resolvePoseForearmDepth(
+              selectedPoseForearm.rawAxis,
+              poseForearmDepthModeRef.current,
+            )
+          : null;
+      const handPose = selectedLandmarks
         ? calculateWristPose(
             selectedLandmarks,
             selectedWorldLandmarks,
@@ -846,9 +995,37 @@ export default function Home() {
             },
           )
         : null;
+      const rawPose = handPose
+        ? armAxisModeRef.current === "pose"
+          ? selectedPoseForearm
+            ? applyForearmAxisToWristPose(
+                handPose,
+                selectedPoseForearm.axis,
+              )
+            : null
+          : armAxisModeRef.current === "basis"
+            ? dPoseForearm
+              ? applyPoseHandWristBasis(
+                  handPose,
+                  dPoseForearm.axis,
+                  selectedWorldLandmarks,
+                )
+              : null
+            : handPose
+        : null;
       const handScore = result.handedness[selectedIndex]?.[0]?.score ?? 1;
       const confidenceAdjustedPose = rawPose
-        ? { ...rawPose, confidence: Math.min(rawPose.confidence, handScore) }
+        ? {
+            ...rawPose,
+            confidence: Math.min(
+              rawPose.confidence,
+              handScore,
+              armAxisModeRef.current === "pose" ||
+                armAxisModeRef.current === "basis"
+                ? (selectedPoseForearm?.confidence ?? 0)
+                : 1,
+            ),
+          }
         : null;
       const host = overlayHostRef.current;
       const stageAspect =
@@ -893,6 +1070,26 @@ export default function Home() {
           ? { ...pose, wristWidth: fitResult.wristWidth }
           : pose;
       renderPoseRef.current = renderPose;
+      const screenSpaceMeasurement =
+        armAxisModeRef.current === "screen" && renderPose && selectedLandmarks
+          ? calculateScreenSpaceWristFit(
+              renderPose,
+              selectedLandmarks,
+              sourceAspect,
+              stageAspect,
+              calibrationRef.current.braceletFitRatio,
+            )
+          : null;
+      const screenSpaceFit =
+        armAxisModeRef.current === "screen"
+          ? screenSpaceMeasurement
+            ? screenSpaceFitSmootherRef.current.update(
+                screenSpaceMeasurement,
+                timestamp,
+              )
+            : screenSpaceFitSmootherRef.current.hold(timestamp)
+          : null;
+      screenSpaceFitRef.current = screenSpaceFit;
       poseVisibleRef.current = Boolean(displayPose);
       if (displayPose && renderPose) {
         lastVisiblePoseTimestampRef.current = timestamp;
@@ -900,21 +1097,29 @@ export default function Home() {
       }
       if (fitResult) updateAutoFitStatus(fitResult.status);
 
-      if (
-        calibrationOpenRef.current &&
-        timestamp - lastDebugUpdateRef.current >= 100
-      ) {
-        setDebugFrame({
-          landmarks: selectedLandmarks ?? [],
-          pose: renderPose,
-          orientationConfidence: renderPose
-            ? calculateOrientationConfidence(renderPose)
-            : null,
-          sourceAspect,
-          stageAspect,
-        });
-        lastDebugUpdateRef.current = timestamp;
-      }
+      debugFrameSourceRef.current = {
+        landmarks: selectedLandmarks ?? [],
+        pose: renderPose,
+        armAxisMode: armAxisModeRef.current,
+        poseElbow: selectedPoseForearm?.elbow ?? null,
+        poseWrist: selectedPoseForearm?.wrist ?? null,
+        poseConfidence: selectedPoseForearm?.confidence ?? null,
+        poseHandedness: selectedPoseForearm?.handedness ?? null,
+        poseForearmRawAxis: dPoseForearm?.rawAxis ?? null,
+        poseForearmDepthTiltAngle:
+          dPoseForearm?.depthTiltAngle ?? null,
+        braceletNormal: null,
+        rotationErrorDegrees: null,
+        rotationAlpha: null,
+        rotationSmoothingEnabled: null,
+        worldGravityDown: null,
+        orientationConfidence: renderPose
+          ? calculateTwistConfidence(renderPose)
+          : null,
+        screenSpaceFit,
+        sourceAspect,
+        stageAspect,
+      };
 
       if (displayPose) {
         selectedHandRef.current = displayPose.handedness;
@@ -935,8 +1140,14 @@ export default function Home() {
         heldPose && poseVisibleRef.current
           ? posePredictorRef.current.predict(timestamp) ?? heldPose
           : heldPose;
-      if (!pose) {
+      const screenSpaceFit =
+        armAxisModeRef.current === "screen"
+          ? screenSpaceFitSmootherRef.current.hold(timestamp)
+          : null;
+      screenSpaceFitRef.current = screenSpaceFit;
+      if (!pose || (armAxisModeRef.current === "screen" && !screenSpaceFit)) {
         renderPoseRef.current = null;
+        screenSpaceFitRef.current = null;
         if (renderedPoseRef.current) {
           const renderStartedAt = performance.now();
           renderer.clear();
@@ -985,7 +1196,17 @@ export default function Home() {
                 ),
               ));
         const renderStartedAt = performance.now();
-        renderer.render(pose, physics, opacity, timestamp);
+        if (armAxisModeRef.current === "screen") {
+          renderer.renderScreenSpace(screenSpaceFit, pose, opacity);
+        } else if (armAxisModeRef.current === "basis") {
+          renderer.renderBasis(
+            pose,
+            opacity,
+            basisRotationSmoothingEnabledRef.current,
+          );
+        } else {
+          renderer.render(pose, physics, opacity, timestamp);
+        }
         recordPerformanceMetric(
           performanceAccumulatorRef.current,
           "renderMs",
@@ -993,6 +1214,32 @@ export default function Home() {
         );
         renderedPoseRef.current = true;
         updateTrackingState(true);
+      }
+
+      if (
+        calibrationOpenRef.current &&
+        timestamp - lastDebugUpdateRef.current >= 100
+      ) {
+        const source = debugFrameSourceRef.current;
+        const orientationDebug = renderer.getOrientationDebug();
+        setDebugFrame(
+          source
+            ? {
+                ...source,
+                braceletNormal: orientationDebug?.ringNormal ?? null,
+                rotationErrorDegrees:
+                  orientationDebug?.rotation?.errorDegrees ?? null,
+                rotationAlpha: orientationDebug?.rotation?.alpha ?? null,
+                rotationSmoothingEnabled:
+                  orientationDebug?.rotation?.enabled ?? null,
+                worldGravityDown: worldGravityDebugRef.current
+                  ? { ...worldGravityDebugRef.current }
+                  : null,
+                screenSpaceFit,
+              }
+            : null,
+        );
+        lastDebugUpdateRef.current = timestamp;
       }
 
       publishPerformanceStats(timestamp);
@@ -1004,27 +1251,16 @@ export default function Home() {
     [publishPerformanceStats, updateTrackingState],
   );
 
-  const prepareMainThreadHandLandmarker = useCallback(async () => {
-    if (handLandmarkerRef.current) return;
+  const prepareMainThreadLandmarkers = useCallback(async () => {
+    if (handLandmarkerRef.current && poseLandmarkerRef.current) return true;
 
-    const { FilesetResolver, HandLandmarker } = await import(
+    const { FilesetResolver, HandLandmarker, PoseLandmarker } = await import(
       "@mediapipe/tasks-vision"
     );
     configureMediaPipeRuntimeLogging();
     const vision = await FilesetResolver.forVisionTasks(mediaPipeWasmPath);
 
-    try {
-      handLandmarkerRef.current = await HandLandmarker.createFromOptions(
-        vision,
-        {
-          ...handLandmarkerOptions,
-          baseOptions: {
-            modelAssetPath: handLandmarkerModelAssetPath,
-            delegate: "GPU",
-          },
-        },
-      );
-    } catch {
+    if (!handLandmarkerRef.current) {
       try {
         handLandmarkerRef.current = await HandLandmarker.createFromOptions(
           vision,
@@ -1032,14 +1268,60 @@ export default function Home() {
             ...handLandmarkerOptions,
             baseOptions: {
               modelAssetPath: handLandmarkerModelAssetPath,
+              delegate: "GPU",
+            },
+          },
+        );
+      } catch {
+        try {
+          handLandmarkerRef.current = await HandLandmarker.createFromOptions(
+            vision,
+            {
+              ...handLandmarkerOptions,
+              baseOptions: {
+                modelAssetPath: handLandmarkerModelAssetPath,
+                delegate: "CPU",
+              },
+            },
+          );
+        } catch {
+          throw new Error(modelLoadErrorMessage);
+        }
+      }
+    }
+
+    if (poseLandmarkerRef.current) return true;
+
+    try {
+      poseLandmarkerRef.current = await PoseLandmarker.createFromOptions(
+        vision,
+        {
+          ...poseLandmarkerOptions,
+          baseOptions: {
+            modelAssetPath: poseLandmarkerModelAssetPath,
+            delegate: "GPU",
+          },
+        },
+      );
+    } catch {
+      try {
+        poseLandmarkerRef.current = await PoseLandmarker.createFromOptions(
+          vision,
+          {
+            ...poseLandmarkerOptions,
+            baseOptions: {
+              modelAssetPath: poseLandmarkerModelAssetPath,
               delegate: "CPU",
             },
           },
         );
       } catch {
-        throw new Error(modelLoadErrorMessage);
+        poseLandmarkerRef.current = null;
+        return false;
       }
     }
+
+    return true;
   }, []);
 
   const scheduleDetection = useCallback((video: HTMLVideoElement) => {
@@ -1073,7 +1355,12 @@ export default function Home() {
       workerBusyRef.current = false;
 
       try {
-        await prepareMainThreadHandLandmarker();
+        const poseAvailable = await prepareMainThreadLandmarkers();
+        poseModelAvailableRef.current = poseAvailable;
+        setPoseModelStatus(poseAvailable ? "ready" : "unavailable");
+        setPoseModelMessage(
+          poseAvailable ? "" : poseModelLoadErrorMessage,
+        );
       } catch {
         failTracking(modelLoadErrorMessage, "model-loading");
         return;
@@ -1086,13 +1373,14 @@ export default function Home() {
       const video = videoRef.current;
       if (video) scheduleDetection(video);
     },
-    [failTracking, prepareMainThreadHandLandmarker, scheduleDetection],
+    [failTracking, prepareMainThreadLandmarkers, scheduleDetection],
   );
 
   const detectionLoop = useCallback((metadata?: VideoFrameCallbackMetadata) => {
     const video = videoRef.current;
     const worker = handTrackingWorkerRef.current;
     const landmarker = handLandmarkerRef.current;
+    const poseLandmarker = poseLandmarkerRef.current;
 
     if (!isActiveRef.current || !video || (!worker && !landmarker)) return;
 
@@ -1130,6 +1418,9 @@ export default function Home() {
                     sessionId: trackingSessionRef.current,
                     timestamp,
                     videoTime,
+                    includePose:
+                      armAxisModeRef.current === "pose" ||
+                      armAxisModeRef.current === "basis",
                   },
                   [frame],
                 );
@@ -1150,12 +1441,38 @@ export default function Home() {
         try {
           const inferenceStartedAt = performance.now();
           const result = landmarker.detectForVideo(video, trackingStartedAt);
+          let poseResult: PoseLandmarkerResult | undefined;
+          if (
+            (armAxisModeRef.current === "pose" ||
+              armAxisModeRef.current === "basis") &&
+            poseLandmarker
+          ) {
+            try {
+              poseResult = poseLandmarker.detectForVideo(
+                video,
+                trackingStartedAt,
+              );
+            } catch {
+              poseLandmarker.close?.();
+              poseLandmarkerRef.current = null;
+              poseModelAvailableRef.current = false;
+              setPoseModelStatus("unavailable");
+              setPoseModelMessage(
+                "Pose 推理运行异常；请切回 Hand-only 或重启相机。",
+              );
+            }
+          }
           recordPerformanceMetric(
             performanceAccumulatorRef.current,
             "inferenceMs",
             performance.now() - inferenceStartedAt,
           );
-          processDetectionResult(result, trackingStartedAt, video.currentTime);
+          processDetectionResult(
+            result,
+            trackingStartedAt,
+            video.currentTime,
+            poseResult,
+          );
           recordPerformanceMetric(
             performanceAccumulatorRef.current,
             "trackingFrameMs",
@@ -1201,7 +1518,12 @@ export default function Home() {
   }, [resizeOverlay]);
 
   const prepareHandLandmarker = useCallback(async () => {
-    if (handTrackingWorkerRef.current || handLandmarkerRef.current) return;
+    if (handTrackingWorkerRef.current) {
+      if (poseModelAvailableRef.current) return true;
+      handTrackingWorkerRef.current.terminate();
+      handTrackingWorkerRef.current = null;
+    }
+    if (handLandmarkerRef.current && poseLandmarkerRef.current) return true;
 
     if (
       typeof Worker !== "undefined" &&
@@ -1215,9 +1537,9 @@ export default function Home() {
         );
 
         let initializationPending = true;
-        let resolveReady: () => void = () => undefined;
+        let resolveReady: (poseAvailable: boolean) => void = () => undefined;
         let rejectReady: (error: Error) => void = () => undefined;
-        const readyPromise = new Promise<void>((resolve, reject) => {
+        const readyPromise = new Promise<boolean>((resolve, reject) => {
           resolveReady = resolve;
           rejectReady = reject;
         });
@@ -1225,14 +1547,23 @@ export default function Home() {
           if (!initializationPending) return;
           initializationPending = false;
           rejectReady(new Error("手部模型加载超时"));
-        }, 10000);
+        }, 20000);
 
         worker.onmessage = (event: MessageEvent<HandTrackingWorkerResponse>) => {
           const message = event.data;
           if (message.type === "ready") {
             initializationPending = false;
             window.clearTimeout(readyTimeout);
-            resolveReady();
+            poseModelAvailableRef.current = message.poseAvailable;
+            setPoseModelStatus(
+              message.poseAvailable ? "ready" : "unavailable",
+            );
+            setPoseModelMessage(
+              message.poseAvailable
+                ? ""
+                : message.poseError || poseModelLoadErrorMessage,
+            );
+            resolveReady(message.poseAvailable);
             return;
           }
 
@@ -1249,7 +1580,15 @@ export default function Home() {
                 message.result,
                 message.timestamp,
                 message.videoTime,
+                message.poseResult,
               );
+              if (message.poseError) {
+                poseModelAvailableRef.current = false;
+                setPoseModelStatus("unavailable");
+                setPoseModelMessage(
+                  "Pose 推理运行异常；请切回 Hand-only 或重启相机。",
+                );
+              }
               recordPerformanceMetric(
                 performanceAccumulatorRef.current,
                 "trackingFrameMs",
@@ -1296,19 +1635,24 @@ export default function Home() {
         worker.postMessage({
           type: "initialize",
           modelAssetPath: handLandmarkerModelAssetPath,
+          poseModelAssetPath: poseLandmarkerModelAssetPath,
           wasmPath: mediaPipeWasmPath,
         });
-        await readyPromise;
+        const poseAvailable = await readyPromise;
         handTrackingWorkerRef.current = worker;
-        return;
+        return poseAvailable;
       } catch {
         worker?.terminate();
         workerBusyRef.current = false;
       }
     }
 
-    await prepareMainThreadHandLandmarker();
-  }, [failTracking, prepareMainThreadHandLandmarker, processDetectionResult]);
+    const poseAvailable = await prepareMainThreadLandmarkers();
+    poseModelAvailableRef.current = poseAvailable;
+    setPoseModelStatus(poseAvailable ? "ready" : "unavailable");
+    setPoseModelMessage(poseAvailable ? "" : poseModelLoadErrorMessage);
+    return poseAvailable;
+  }, [failTracking, prepareMainThreadLandmarkers, processDetectionResult]);
 
   const enableDeviceMotion = useCallback(async () => {
     if (motionHandlerRef.current) return;
@@ -1348,6 +1692,10 @@ export default function Home() {
         y: vector.y / length,
         z: vector.z / length,
       };
+      worldGravityDebugRef.current = calculateWorldDownInThree(
+        vector,
+        getScreenOrientationAngle(),
+      );
     };
 
     motionHandlerRef.current = handler;
@@ -1371,6 +1719,11 @@ export default function Home() {
         throw new Error("当前浏览器不支持摄像头");
       }
 
+      // iOS requires the motion permission request to remain in this explicit
+      // start-button gesture. The resulting vector is diagnostic-only.
+      worldGravityDebugRef.current = null;
+      await enableDeviceMotion();
+
       stream = await navigator.mediaDevices.getUserMedia({
         audio: false,
         video: {
@@ -1380,9 +1733,11 @@ export default function Home() {
         },
       });
 
+      if (!poseModelAvailableRef.current) {
+        setPoseModelStatus("loading");
+        setPoseModelMessage("");
+      }
       await prepareHandLandmarker();
-      await enableDeviceMotion();
-
       const video = videoRef.current;
       if (!video) throw new Error("摄像头画面初始化失败");
 
@@ -1393,6 +1748,7 @@ export default function Home() {
       lastVideoTimeRef.current = -1;
       lastFrameTimestampRef.current = 0;
       renderPoseRef.current = null;
+      screenSpaceFitRef.current = null;
       poseVisibleRef.current = false;
       lastVisiblePoseTimestampRef.current = 0;
       renderedPoseRef.current = false;
@@ -1407,6 +1763,7 @@ export default function Home() {
       selectedHandRef.current = "Unknown";
       gravityRef.current = defaultGravity;
       poseSmootherRef.current.reset();
+      screenSpaceFitSmootherRef.current.reset();
       scaleControllerRef.current.reset();
       updateAutoFitStatus("settling");
       physicsRef.current.reset();
@@ -1447,9 +1804,11 @@ export default function Home() {
     detectedHandsRef.current = 0;
     handCountStabilizerRef.current.reset();
     selectedHandRef.current = "Unknown";
+    worldGravityDebugRef.current = null;
     lastVideoTimeRef.current = -1;
     lastFrameTimestampRef.current = 0;
     renderPoseRef.current = null;
+    screenSpaceFitRef.current = null;
     poseVisibleRef.current = false;
     lastVisiblePoseTimestampRef.current = 0;
     renderedPoseRef.current = false;
@@ -1458,9 +1817,11 @@ export default function Home() {
     workerBusyRef.current = false;
     trackingSessionRef.current += 1;
     poseSmootherRef.current.reset();
+    screenSpaceFitSmootherRef.current.reset();
     scaleControllerRef.current.reset();
     updateAutoFitStatus("settling");
     physicsRef.current.reset();
+    debugFrameSourceRef.current = null;
     setDebugFrame(null);
     resetPerformanceStats();
     rendererRef.current?.clear();
@@ -1499,6 +1860,7 @@ export default function Home() {
       window.removeEventListener("resize", handleResize);
       stopCamera();
       handLandmarkerRef.current?.close?.();
+      poseLandmarkerRef.current?.close?.();
       handTrackingWorkerRef.current?.terminate();
       handTrackingWorkerRef.current = null;
     };
@@ -1627,32 +1989,46 @@ export default function Home() {
     status === "loading"
       ? "正在连接摄像头"
       : status === "ready"
-        ? "请将整只手和手腕放入取景框"
+        ? armAxisMode === "pose" || armAxisMode === "basis"
+          ? "请将同侧手肘、手腕和手掌放入取景框"
+          : "请将整只手和手腕放入取景框"
         : status === "error"
           ? errorMessage
           : "启动相机后开始识别";
   const errorRecovery = errorRecoveryCopy[errorRecoveryKind];
   const debugLandmarks = debugFrame?.landmarks ?? null;
   const debugPose = debugFrame?.pose ?? null;
+  const debugScreenSpaceFit =
+    debugFrame?.armAxisMode === "screen"
+      ? debugFrame.screenSpaceFit
+      : null;
+  const debugBasisOrthogonalityError =
+    debugFrame?.armAxisMode === "basis" && debugPose
+      ? calculateBasisOrthogonalityError({
+          armAxis: debugPose.armAxis,
+          lateralAxis: debugPose.lateralAxis,
+          normal: debugPose.palmNormal,
+        })
+      : null;
   const debugSourceAspect = debugFrame?.sourceAspect ?? 4 / 3;
   const debugStageAspect = debugFrame?.stageAspect ?? 4 / 3;
   const debugMappedPoints = debugLandmarks
     ? [0, 5, 9, 13, 17].flatMap((index) => {
         const landmark = debugLandmarks[index];
         return landmark
-          ? [{ index, point: mapPointToStage(landmark, debugSourceAspect, debugStageAspect) }]
+          ? [{ index, point: mapCameraPointToStage(landmark, debugSourceAspect, debugStageAspect) }]
           : [];
       })
     : [];
   const debugWristPoint = debugLandmarks?.[0]
-    ? mapPointToStage(debugLandmarks[0], debugSourceAspect, debugStageAspect)
+    ? mapCameraPointToStage(debugLandmarks[0], debugSourceAspect, debugStageAspect)
     : null;
   const debugPalmCenter =
     debugLandmarks?.[5] &&
     debugLandmarks[9] &&
     debugLandmarks[13] &&
     debugLandmarks[17]
-      ? mapPointToStage(
+      ? mapCameraPointToStage(
           {
             x:
               ((debugLandmarks[5].x + debugLandmarks[17].x) / 2) * 0.72 +
@@ -1665,25 +2041,125 @@ export default function Home() {
           debugStageAspect,
         )
       : null;
+  const debugPoseElbowPoint = debugFrame?.poseElbow
+    ? mapCameraPointToStage(
+        debugFrame.poseElbow,
+        debugSourceAspect,
+        debugStageAspect,
+      )
+    : null;
+  const debugPoseWristPoint = debugFrame?.poseWrist
+    ? mapCameraPointToStage(
+        debugFrame.poseWrist,
+        debugSourceAspect,
+        debugStageAspect,
+      )
+    : null;
+  const debugArmStart =
+    debugFrame?.armAxisMode === "pose" ||
+    debugFrame?.armAxisMode === "basis"
+      ? debugPoseElbowPoint
+      : debugWristPoint;
+  const debugArmEnd =
+    debugFrame?.armAxisMode === "pose" ||
+    debugFrame?.armAxisMode === "basis"
+      ? debugPoseWristPoint
+      : debugPalmCenter;
+  const debugArmDelta =
+    debugArmStart && debugArmEnd
+      ? {
+          x: debugArmEnd.x - debugArmStart.x,
+          y: debugArmEnd.y - debugArmStart.y,
+        }
+      : null;
   const debugArmAngle =
-    debugWristPoint && debugPalmCenter
+    debugArmDelta
       ? (Math.atan2(
-          debugPalmCenter.y - debugWristPoint.y,
-          debugPalmCenter.x - debugWristPoint.x,
+          debugArmDelta.y,
+          debugArmDelta.x * debugStageAspect,
         ) *
           180) /
         Math.PI
       : 0;
   const debugArmLength =
-    debugWristPoint && debugPalmCenter
+    debugArmDelta
       ? Math.max(
           2,
-          Math.hypot(
-            debugPalmCenter.x - debugWristPoint.x,
-            debugPalmCenter.y - debugWristPoint.y,
-          ) * 100,
+          (Math.hypot(
+            debugArmDelta.x * debugStageAspect,
+            debugArmDelta.y,
+          ) /
+            debugStageAspect) *
+            100,
         )
       : 0;
+  const debugCrossSectionDelta = debugScreenSpaceFit
+    ? {
+        x: debugScreenSpaceFit.right.x - debugScreenSpaceFit.left.x,
+        y: debugScreenSpaceFit.right.y - debugScreenSpaceFit.left.y,
+      }
+    : null;
+  const debugCrossSectionAngle = debugCrossSectionDelta
+    ? (Math.atan2(
+        debugCrossSectionDelta.y,
+        debugCrossSectionDelta.x * debugStageAspect,
+      ) *
+        180) /
+      Math.PI
+    : 0;
+  const debugCrossSectionLength = debugCrossSectionDelta
+    ? (Math.hypot(
+        debugCrossSectionDelta.x * debugStageAspect,
+        debugCrossSectionDelta.y,
+      ) /
+        debugStageAspect) *
+      100
+    : 0;
+  const debugScreenFitAngle = debugScreenSpaceFit
+    ? calculateMirroredStageAngle(
+        debugScreenSpaceFit.left,
+        debugScreenSpaceFit.right,
+        debugStageAspect,
+      )
+    : null;
+  const debugForearmScreenAngle =
+    debugPoseElbowPoint && debugPoseWristPoint
+      ? calculateMirroredStageAngle(
+          debugPoseElbowPoint,
+          debugPoseWristPoint,
+          debugStageAspect,
+        )
+      : null;
+  const debugBraceletNormalScreenAngle = debugFrame?.braceletNormal
+    ? calculateMirroredSceneAngle(debugFrame.braceletNormal)
+    : null;
+  const debugGravityScreenAngle = debugFrame?.worldGravityDown
+    ? calculateMirroredSceneAngle(debugFrame.worldGravityDown)
+    : null;
+  const debugForearmGravityAngle = calculateScreenAxisAngleError(
+    debugForearmScreenAngle,
+    debugGravityScreenAngle,
+  );
+  const debugBraceletForearmAngle = calculateScreenAxisAngleError(
+    debugForearmScreenAngle,
+    debugBraceletNormalScreenAngle,
+  );
+  const debugBraceletNormalRawAngle = debugFrame?.braceletNormal
+    ? (Math.atan2(
+        -debugFrame.braceletNormal.y,
+        debugFrame.braceletNormal.x,
+      ) *
+        180) /
+      Math.PI
+    : 0;
+  const debugGravityRawAngle = debugFrame?.worldGravityDown
+    ? (Math.atan2(
+        -debugFrame.worldGravityDown.y,
+        debugFrame.worldGravityDown.x,
+      ) *
+        180) /
+      Math.PI
+    : 0;
 
   return (
     <main className="tryon-shell">
@@ -1709,9 +2185,23 @@ export default function Home() {
           <div className="section-heading">
             <div>
               <p className="eyebrow">LIVE FITTING / 3D DEPTH</p>
-              <h2>把整只手和手腕放入画面</h2>
+              <h2>
+                {armAxisMode === "pose" || armAxisMode === "basis"
+                  ? "把同侧手肘和手腕放入画面"
+                  : "把整只手和手腕放入画面"}
+              </h2>
             </div>
-            <span className="camera-meta">HAND / WRIST</span>
+            <span className="camera-meta">
+              {armAxisMode === "pose"
+                ? "POSE / FOREARM"
+                : armAxisMode === "screen"
+                  ? "SCREEN / CROSS-SECTION"
+                  : armAxisMode === "basis"
+                    ? poseForearmDepthMode === "3d"
+                      ? "D 3D / POSE DEPTH"
+                      : "D FLAT / POSE Z OFF"
+                    : "HAND / WRIST"}
+            </span>
           </div>
 
           <div
@@ -1778,7 +2268,7 @@ export default function Home() {
                     }}
                   />
                 ))}
-                {debugPose && (
+                {debugPose && debugFrame?.armAxisMode !== "screen" && (
                   <span
                     className="calibration-anchor-marker"
                     style={{
@@ -1787,14 +2277,82 @@ export default function Home() {
                     }}
                   />
                 )}
-                {debugWristPoint && debugArmLength > 0 && (
+                {debugArmStart && debugArmLength > 0 && (
                   <span
-                    className="calibration-arm-line"
+                    className={`calibration-arm-line ${
+                      debugFrame?.armAxisMode === "pose" ||
+                      debugFrame?.armAxisMode === "basis"
+                        ? "is-pose"
+                        : ""
+                    }`}
                     style={{
-                      left: `${debugWristPoint.x * 100}%`,
-                      top: `${debugWristPoint.y * 100}%`,
+                      left: `${debugArmStart.x * 100}%`,
+                      top: `${debugArmStart.y * 100}%`,
                       width: `${debugArmLength}%`,
                       transform: `translateY(-50%) rotate(${debugArmAngle}deg)`,
+                    }}
+                  />
+                )}
+                {debugScreenSpaceFit && (
+                  <>
+                    <span
+                      className="calibration-screen-point is-center"
+                      style={{
+                        left: `${debugScreenSpaceFit.center.x * 100}%`,
+                        top: `${debugScreenSpaceFit.center.y * 100}%`,
+                      }}
+                    >
+                      <small>C</small>
+                    </span>
+                    <span
+                      className="calibration-screen-point is-left"
+                      style={{
+                        left: `${debugScreenSpaceFit.left.x * 100}%`,
+                        top: `${debugScreenSpaceFit.left.y * 100}%`,
+                      }}
+                    >
+                      <small>L</small>
+                    </span>
+                    <span
+                      className="calibration-screen-point is-right"
+                      style={{
+                        left: `${debugScreenSpaceFit.right.x * 100}%`,
+                        top: `${debugScreenSpaceFit.right.y * 100}%`,
+                      }}
+                    >
+                      <small>R</small>
+                    </span>
+                    <span
+                      className="calibration-cross-section-line"
+                      style={{
+                        left: `${debugScreenSpaceFit.left.x * 100}%`,
+                        top: `${debugScreenSpaceFit.left.y * 100}%`,
+                        width: `${debugCrossSectionLength}%`,
+                        transform: `translateY(-50%) rotate(${debugCrossSectionAngle}deg)`,
+                      }}
+                    />
+                  </>
+                )}
+                {debugPose && debugFrame?.braceletNormal && (
+                  <span
+                    className="calibration-normal-line"
+                    style={{
+                      left: `${debugPose.x * 100}%`,
+                      top: `${debugPose.y * 100}%`,
+                      transform: `translate(-50%, -50%) rotate(${debugBraceletNormalRawAngle}deg)`,
+                    }}
+                  />
+                )}
+                {debugPose &&
+                  debugFrame?.armAxisMode !== "screen" &&
+                  debugFrame?.armAxisMode !== "basis" &&
+                  debugGravityScreenAngle !== null && (
+                  <span
+                    className="calibration-gravity-line"
+                    style={{
+                      left: `${debugPose.x * 100}%`,
+                      top: `${debugPose.y * 100}%`,
+                      transform: `translate(-50%, -50%) rotate(${debugGravityRawAngle}deg)`,
                     }}
                   />
                 )}
@@ -1802,7 +2360,17 @@ export default function Home() {
             )}
 
             <div className="stage-footer">
-              <span>WEBGL / OCCLUSION</span>
+              <span>
+                {armAxisMode === "pose"
+                  ? "AXIS B / POSE ELBOW-WRIST"
+                  : armAxisMode === "screen"
+                    ? "FIT C / SCREEN CROSS-SECTION"
+                    : armAxisMode === "basis"
+                      ? poseForearmDepthMode === "3d"
+                        ? "BASIS D 3D / POSE XYZ"
+                        : "BASIS D FLAT / POSE XY"
+                      : "AXIS A / HAND-ONLY"}
+              </span>
               <span>{`HANDS: ${detectedHands}`}</span>
             </div>
           </div>
@@ -1884,16 +2452,127 @@ export default function Home() {
                 </button>
               </div>
 
+              <div className="calibration-control calibration-anchor-mode axis-ab-control">
+                <div className="calibration-control-heading">
+                  <span>Tracking / Fitting Mode</span>
+                  <small>
+                    {armAxisMode === "screen"
+                      ? "SCREEN FIT"
+                      : poseModelStatusLabels[poseModelStatus]}
+                  </small>
+                </div>
+                <div
+                  className="segmented-control"
+                  role="group"
+                  aria-label="Tracking / Fitting Mode A B C D"
+                >
+                  <button
+                    className={armAxisMode === "hand" ? "is-selected" : ""}
+                    type="button"
+                    aria-pressed={armAxisMode === "hand"}
+                    aria-label="A · Hand-only"
+                    onClick={() => selectTrackingFittingMode("hand")}
+                  >
+                    A
+                  </button>
+                  <button
+                    className={armAxisMode === "pose" ? "is-selected" : ""}
+                    type="button"
+                    aria-pressed={armAxisMode === "pose"}
+                    aria-label="B · Pose elbow-wrist"
+                    onClick={() => selectTrackingFittingMode("pose")}
+                  >
+                    B
+                  </button>
+                  <button
+                    className={armAxisMode === "screen" ? "is-selected" : ""}
+                    type="button"
+                    aria-pressed={armAxisMode === "screen"}
+                    aria-label="C · Screen-space wrist cross-section"
+                    onClick={() => selectTrackingFittingMode("screen")}
+                  >
+                    C
+                  </button>
+                  <button
+                    className={armAxisMode === "basis" ? "is-selected" : ""}
+                    type="button"
+                    aria-pressed={armAxisMode === "basis"}
+                    aria-label="D · Pose arm and Hand lateral 3D basis"
+                    onClick={() => selectTrackingFittingMode("basis")}
+                  >
+                    D
+                  </button>
+                </div>
+                <p className="axis-ab-note" role="status">
+                  {armAxisMode === "pose"
+                    ? poseModelMessage ||
+                      "B 仅用同侧 elbow→wrist 定义轴；看不到手肘时会淡出，不回退到 Hand。"
+                    : armAxisMode === "screen"
+                      ? "C 使用稳定腕部锚点、屏幕空间前臂方向和腕宽截面拟合；不使用 3D quaternion 约束。"
+                      : armAxisMode === "basis"
+                        ? poseModelMessage ||
+                          "D 用 Pose elbow→wrist 和 Hand MCP 5→17 重建正交 3D basis；不使用完整 Hand/Pose quaternion。"
+                        : "A 保持现有 Hand-only armAxis，且不执行 Pose 推理。"}
+                </p>
+              </div>
+
+              {armAxisMode === "basis" && (
+                <div className="calibration-control d-depth-control">
+                  <div className="calibration-control-heading">
+                    <span>Pose Forearm Depth</span>
+                    <small>
+                      {poseForearmDepthMode === "3d"
+                        ? "D 3D · 保留 Pose Z"
+                        : "D FLAT · Z = 0"}
+                    </small>
+                  </div>
+                  <div
+                    className="segmented-control d-depth-segmented"
+                    role="group"
+                    aria-label="Pose Forearm Depth 3D Flat"
+                  >
+                    <button
+                      className={
+                        poseForearmDepthMode === "3d" ? "is-selected" : ""
+                      }
+                      type="button"
+                      aria-pressed={poseForearmDepthMode === "3d"}
+                      onClick={() => selectPoseForearmDepthMode("3d")}
+                    >
+                      3D
+                    </button>
+                    <button
+                      className={
+                        poseForearmDepthMode === "flat" ? "is-selected" : ""
+                      }
+                      type="button"
+                      aria-pressed={poseForearmDepthMode === "flat"}
+                      onClick={() => selectPoseForearmDepthMode("flat")}
+                    >
+                      Flat
+                    </button>
+                  </div>
+                  <p className="axis-ab-note">
+                    仅控制 Pose elbow→wrist raw Z；其余 D basis、尺寸与滤波保持不变。
+                  </p>
+                </div>
+              )}
+
               <label className="calibration-mode">
                 <span>
                   <span>重力物理（调试）</span>
                   <small>
-                    {physicsEnabled ? "ON · 重力滑动" : "OFF · 刚性跟随"}
+                    {armAxisMode === "basis"
+                      ? "N/A · D 不使用重力"
+                      : physicsEnabled
+                        ? "ON · 重力滑动"
+                        : "OFF · 刚性跟随"}
                   </small>
                 </span>
                 <input
                   type="checkbox"
-                  checked={physicsEnabled}
+                  checked={armAxisMode === "basis" ? false : physicsEnabled}
+                  disabled={armAxisMode === "basis"}
                   onChange={(event) => {
                     const enabled = event.target.checked;
                     physicsEnabledRef.current = enabled;
@@ -1919,6 +2598,7 @@ export default function Home() {
                     const enabled = event.target.checked;
                     positionFilterEnabledRef.current = enabled;
                     poseSmootherRef.current.reset();
+                    screenSpaceFitSmootherRef.current.reset();
                     posePredictorRef.current.reset();
                     setPositionFilterEnabled(enabled);
                   }}
@@ -1929,20 +2609,33 @@ export default function Home() {
                 <span>
                   <span>Rotation Smoothing</span>
                   <small>
-                    {calibration.rotationSmoothingEnabled
-                      ? "ON · QUATERNION SLERP"
-                      : "OFF · RAW ORIENTATION"}
+                    {armAxisMode === "basis"
+                      ? basisRotationSmoothingEnabled
+                        ? "ON · ADAPTIVE QUATERNION"
+                        : "OFF · DIRECT TARGET"
+                      : calibration.rotationSmoothingEnabled
+                        ? "ON · QUATERNION SLERP"
+                        : "OFF · RAW ORIENTATION"}
                   </small>
                 </span>
                 <input
                   type="checkbox"
-                  checked={calibration.rotationSmoothingEnabled}
-                  onChange={(event) =>
+                  checked={
+                    armAxisMode === "basis"
+                      ? basisRotationSmoothingEnabled
+                      : calibration.rotationSmoothingEnabled
+                  }
+                  onChange={(event) => {
+                    const enabled = event.target.checked;
+                    if (armAxisMode === "basis") {
+                      selectBasisRotationSmoothing(enabled);
+                      return;
+                    }
                     updateCalibration((current) => ({
                       ...current,
-                      rotationSmoothingEnabled: event.target.checked,
-                    }))
-                  }
+                      rotationSmoothingEnabled: enabled,
+                    }));
+                  }}
                 />
               </label>
 
@@ -1972,6 +2665,7 @@ export default function Home() {
                         anchorMode: "wrist",
                       }));
                       poseSmootherRef.current.reset();
+                      screenSpaceFitSmootherRef.current.reset();
                       physicsRef.current.reset();
                     }}
                   >
@@ -1991,6 +2685,7 @@ export default function Home() {
                         anchorMode: "palm-root",
                       }));
                       poseSmootherRef.current.reset();
+                      screenSpaceFitSmootherRef.current.reset();
                       physicsRef.current.reset();
                     }}
                   >
@@ -2204,25 +2899,236 @@ export default function Home() {
               </details>
 
               <div className="calibration-stats">
-                <span>
-                  腕宽估算
-                  <strong>
-                    {debugPose ? `${Math.round(debugPose.wristWidth * 100)}%` : "--"}
-                  </strong>
-                </span>
-                <span>
-                  自动尺寸
-                  <strong>{autoFitStatusLabels[autoFitStatus]}</strong>
-                </span>
-                <span>
-                  Orientation Confidence
-                  <strong>
-                    {debugFrame?.orientationConfidence === null ||
-                    debugFrame?.orientationConfidence === undefined
-                      ? "--"
-                      : `${Math.round(debugFrame.orientationConfidence * 100)}%`}
-                  </strong>
-                </span>
+                {armAxisMode === "screen" ? (
+                  <>
+                    <span>
+                      Wrist Center
+                      <strong>
+                        {debugScreenSpaceFit
+                          ? `${(debugScreenSpaceFit.center.x * 100).toFixed(1)}%, ${(debugScreenSpaceFit.center.y * 100).toFixed(1)}%`
+                          : "--"}
+                      </strong>
+                    </span>
+                    <span>
+                      Left Endpoint
+                      <strong>
+                        {debugScreenSpaceFit
+                          ? `${(debugScreenSpaceFit.left.x * 100).toFixed(1)}%, ${(debugScreenSpaceFit.left.y * 100).toFixed(1)}%`
+                          : "--"}
+                      </strong>
+                    </span>
+                    <span>
+                      Right Endpoint
+                      <strong>
+                        {debugScreenSpaceFit
+                          ? `${(debugScreenSpaceFit.right.x * 100).toFixed(1)}%, ${(debugScreenSpaceFit.right.y * 100).toFixed(1)}%`
+                          : "--"}
+                      </strong>
+                    </span>
+                    <span>
+                      Cross-section Line
+                      <strong>
+                        {debugScreenSpaceFit
+                          ? `${(debugScreenSpaceFit.wristScreenWidth * 100).toFixed(1)}% stage height`
+                          : "--"}
+                      </strong>
+                    </span>
+                    <span>
+                      Screen Angle
+                      <strong>{formatDegrees(debugScreenFitAngle)}</strong>
+                    </span>
+                    <span>
+                      Wrist Screen Width
+                      <strong>
+                        {debugScreenSpaceFit
+                          ? `${(debugScreenSpaceFit.wristScreenWidth * 100).toFixed(1)}%`
+                          : "--"}
+                      </strong>
+                    </span>
+                  </>
+                ) : armAxisMode === "basis" ? (
+                  <>
+                    <span>
+                      raw armAxis.x
+                      <strong>
+                        {debugFrame?.poseForearmRawAxis
+                          ? debugFrame.poseForearmRawAxis.x.toFixed(5)
+                          : "--"}
+                      </strong>
+                    </span>
+                    <span>
+                      raw armAxis.y
+                      <strong>
+                        {debugFrame?.poseForearmRawAxis
+                          ? debugFrame.poseForearmRawAxis.y.toFixed(5)
+                          : "--"}
+                      </strong>
+                    </span>
+                    <span>
+                      raw armAxis.z
+                      <strong>
+                        {debugFrame?.poseForearmRawAxis
+                          ? debugFrame.poseForearmRawAxis.z.toFixed(5)
+                          : "--"}
+                      </strong>
+                    </span>
+                    <span>
+                      arm depth tilt angle
+                      <strong>
+                        {formatDegrees(
+                          debugFrame?.poseForearmDepthTiltAngle ?? null,
+                        )}
+                      </strong>
+                    </span>
+                    <span>
+                      Rotation Error °
+                      <strong>
+                        {debugFrame?.rotationErrorDegrees === null ||
+                        debugFrame?.rotationErrorDegrees === undefined
+                          ? "--"
+                          : `${debugFrame.rotationErrorDegrees.toFixed(2)}°`}
+                      </strong>
+                    </span>
+                    <span>
+                      Rotation Alpha
+                      <strong>
+                        {debugFrame?.rotationAlpha === null ||
+                        debugFrame?.rotationAlpha === undefined
+                          ? "--"
+                          : debugFrame.rotationAlpha.toFixed(3)}
+                      </strong>
+                    </span>
+                    <span>
+                      Rotation Smoothing ON/OFF
+                      <strong>
+                        {debugFrame?.rotationSmoothingEnabled === null ||
+                        debugFrame?.rotationSmoothingEnabled === undefined
+                          ? basisRotationSmoothingEnabled
+                            ? "ON"
+                            : "OFF"
+                          : debugFrame.rotationSmoothingEnabled
+                            ? "ON"
+                            : "OFF"}
+                      </strong>
+                    </span>
+                    <span>
+                      armAxis
+                      <strong>
+                        {formatVector3(debugPose?.armAxis ?? null)}
+                      </strong>
+                    </span>
+                    <span>
+                      lateralAxis
+                      <strong>
+                        {formatVector3(debugPose?.lateralAxis ?? null)}
+                      </strong>
+                    </span>
+                    <span>
+                      normal
+                      <strong>
+                        {formatVector3(debugPose?.palmNormal ?? null)}
+                      </strong>
+                    </span>
+                    <span>
+                      Basis Orthogonality Error
+                      <strong
+                        className={
+                          debugBasisOrthogonalityError !== null &&
+                          debugBasisOrthogonalityError > 1e-4
+                            ? "is-debug-error"
+                            : "is-debug-ok"
+                        }
+                      >
+                        {debugBasisOrthogonalityError === null
+                          ? "--"
+                          : `max |dot| ${debugBasisOrthogonalityError.toExponential(2)}`}
+                      </strong>
+                    </span>
+                  </>
+                ) : (
+                  <>
+                    <span>
+                      Arm Axis
+                      <strong>
+                        {armAxisMode === "pose"
+                          ? debugFrame?.poseHandedness
+                            ? `POSE / ${debugFrame.poseHandedness.toUpperCase()}`
+                            : "POSE / WAIT"
+                          : "HAND-ONLY"}
+                      </strong>
+                    </span>
+                    <span>
+                      Pose Axis Confidence
+                      <strong>
+                        {debugFrame?.poseConfidence === null ||
+                        debugFrame?.poseConfidence === undefined
+                          ? "--"
+                          : `${Math.round(debugFrame.poseConfidence * 100)}%`}
+                      </strong>
+                    </span>
+                    <span>
+                      Red · Forearm Screen Angle
+                      <strong>{formatDegrees(debugForearmScreenAngle)}</strong>
+                    </span>
+                    <span>
+                      Green · Bracelet Normal Screen Angle
+                      <strong>
+                        {formatDegrees(debugBraceletNormalScreenAngle)}
+                      </strong>
+                    </span>
+                    <span>
+                      Blue · World Gravity Screen Angle
+                      <strong>{formatDegrees(debugGravityScreenAngle)}</strong>
+                    </span>
+                    <span>
+                      Forearm vs Gravity angle
+                      <strong
+                        className={
+                          debugForearmGravityAngle !== null &&
+                          debugForearmGravityAngle > 5
+                            ? "is-debug-error"
+                            : "is-debug-ok"
+                        }
+                      >
+                        {formatDegrees(debugForearmGravityAngle)}
+                      </strong>
+                    </span>
+                    <span>
+                      Bracelet vs Forearm angle
+                      <strong
+                        className={
+                          debugBraceletForearmAngle !== null &&
+                          debugBraceletForearmAngle > 5
+                            ? "is-debug-error"
+                            : "is-debug-ok"
+                        }
+                      >
+                        {formatDegrees(debugBraceletForearmAngle)}
+                      </strong>
+                    </span>
+                    <span>
+                      腕宽估算
+                      <strong>
+                        {debugPose
+                          ? `${Math.round(debugPose.wristWidth * 100)}%`
+                          : "--"}
+                      </strong>
+                    </span>
+                    <span>
+                      自动尺寸
+                      <strong>{autoFitStatusLabels[autoFitStatus]}</strong>
+                    </span>
+                    <span>
+                      Hand Twist Confidence
+                      <strong>
+                        {debugFrame?.orientationConfidence === null ||
+                        debugFrame?.orientationConfidence === undefined
+                          ? "--"
+                          : `${Math.round(debugFrame.orientationConfidence * 100)}%`}
+                      </strong>
+                    </span>
+                  </>
+                )}
               </div>
               <div
                 className="calibration-stats"
