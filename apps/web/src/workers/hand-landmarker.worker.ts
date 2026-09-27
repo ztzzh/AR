@@ -1,10 +1,18 @@
-import { FilesetResolver, HandLandmarker } from "@mediapipe/tasks-vision";
+import {
+  FilesetResolver,
+  HandLandmarker,
+  PoseLandmarker,
+} from "@mediapipe/tasks-vision";
 
-import type { HandLandmarkerResult } from "../lib/tryon-core";
+import type {
+  HandLandmarkerResult,
+  PoseLandmarkerResult,
+} from "../lib/tryon-core";
 
 type InitializeMessage = {
   type: "initialize";
   modelAssetPath: string;
+  poseModelAssetPath: string;
   wasmPath: string;
 };
 
@@ -14,15 +22,18 @@ type DetectMessage = {
   sessionId: number;
   timestamp: number;
   videoTime: number;
+  includePose: boolean;
 };
 
 type WorkerMessage = InitializeMessage | DetectMessage;
 
 type WorkerResponse =
-  | { type: "ready" }
+  | { type: "ready"; poseAvailable: boolean; poseError?: string }
   | {
       type: "result";
       result: HandLandmarkerResult;
+      poseResult?: PoseLandmarkerResult;
+      poseError?: string;
       sessionId: number;
       timestamp: number;
       videoTime: number;
@@ -36,6 +47,7 @@ const workerScope = self as unknown as {
 };
 
 let handLandmarker: HandLandmarker | null = null;
+let poseLandmarker: PoseLandmarker | null = null;
 
 const errorMessage = (error: unknown) =>
   error instanceof Error ? error.message : "手部模型初始化失败";
@@ -72,7 +84,43 @@ workerScope.onmessage = async (event) => {
         });
       }
 
-      workerScope.postMessage({ type: "ready" });
+      let poseError: string | undefined;
+      const poseOptions = {
+        runningMode: "VIDEO" as const,
+        numPoses: 1,
+        minPoseDetectionConfidence: 0.5,
+        minPosePresenceConfidence: 0.5,
+        minTrackingConfidence: 0.5,
+        outputSegmentationMasks: false,
+      };
+      try {
+        poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
+          ...poseOptions,
+          baseOptions: {
+            modelAssetPath: message.poseModelAssetPath,
+            delegate: "GPU",
+          },
+        });
+      } catch {
+        try {
+          poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
+            ...poseOptions,
+            baseOptions: {
+              modelAssetPath: message.poseModelAssetPath,
+              delegate: "CPU",
+            },
+          });
+        } catch (error) {
+          poseLandmarker = null;
+          poseError = errorMessage(error);
+        }
+      }
+
+      workerScope.postMessage({
+        type: "ready",
+        poseAvailable: Boolean(poseLandmarker),
+        poseError,
+      });
     } catch (error) {
       workerScope.postMessage({ type: "error", message: errorMessage(error) });
     }
@@ -84,6 +132,29 @@ workerScope.onmessage = async (event) => {
 
     const inferenceStartedAt = performance.now();
     const result = handLandmarker.detectForVideo(message.frame, message.timestamp);
+    let poseResult: PoseLandmarkerResult | undefined;
+    let poseError: string | undefined;
+    if (message.includePose) {
+      if (poseLandmarker) {
+        try {
+          const detectedPose = poseLandmarker.detectForVideo(
+            message.frame,
+            message.timestamp,
+          );
+          poseResult = {
+            landmarks: detectedPose.landmarks,
+            worldLandmarks: detectedPose.worldLandmarks,
+          };
+          detectedPose.close();
+        } catch (error) {
+          poseLandmarker.close();
+          poseLandmarker = null;
+          poseError = errorMessage(error);
+        }
+      } else {
+        poseError = "Pose 模型不可用";
+      }
+    }
     const inferenceMs = performance.now() - inferenceStartedAt;
     message.frame.close();
     workerScope.postMessage({
@@ -93,6 +164,8 @@ workerScope.onmessage = async (event) => {
         worldLandmarks: result.worldLandmarks,
         handedness: result.handedness,
       },
+      poseResult,
+      poseError,
       sessionId: message.sessionId,
       timestamp: message.timestamp,
       videoTime: message.videoTime,

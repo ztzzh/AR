@@ -1,6 +1,10 @@
 import * as THREE from "three";
 
-import type { Vector3, WristPose } from "@/lib/tryon-core";
+import type {
+  ScreenSpaceWristFit,
+  Vector3,
+  WristPose,
+} from "@/lib/tryon-core";
 
 type ProductAppearance = {
   tint: string;
@@ -30,14 +34,118 @@ const braceletMajorRadius = 0.5;
 const braceletTubeRadius = 0.064;
 const braceletInnerDiameter =
   2 * (braceletMajorRadius - braceletTubeRadius);
+const braceletOuterDiameter =
+  2 * (braceletMajorRadius + braceletTubeRadius);
 const normalizedPoseUnitsToSceneUnits = 2;
 const orientationConfidenceMinimumRatio = 0.22;
 const orientationConfidenceMaximumRatio = 0.58;
 const orientationSmoothingResponse = 12;
 const sideViewTwistUpdateFloor = 0.02;
+const basisRotationMinAlpha = 0.35;
+const basisRotationMaxAlpha = 0.92;
+const basisRotationResponseGain = 0.35;
 
 const localRightAxis = new THREE.Vector3(1, 0, 0);
 const localUpAxis = new THREE.Vector3(0, 1, 0);
+export const localRingNormal = new THREE.Vector3(0, 0, 1);
+
+/**
+ * TorusGeometry is created in the local XY plane, so its ring normal is local
+ * +Z. Establish that normal first, then add only a signed twist around the
+ * forearm. Palm orientation never gets to tilt the ring plane.
+ */
+export const createBraceletOrientationQuaternion = (
+  forearmAxis: THREE.Vector3,
+  handLateralAxis: THREE.Vector3,
+) => {
+  const arm = forearmAxis.clone().normalize();
+  const normalAlignment = new THREE.Quaternion().setFromUnitVectors(
+    localRingNormal,
+    arm,
+  );
+  const zeroTwistRight = localRightAxis
+    .clone()
+    .applyQuaternion(normalAlignment);
+  const targetRight = handLateralAxis
+    .clone()
+    .addScaledVector(arm, -handLateralAxis.dot(arm));
+
+  if (targetRight.lengthSq() < 1e-8) return normalAlignment;
+  targetRight.normalize();
+
+  const twistAngle = Math.atan2(
+    arm.dot(new THREE.Vector3().crossVectors(zeroTwistRight, targetRight)),
+    zeroTwistRight.dot(targetRight),
+  );
+  const twist = new THREE.Quaternion().setFromAxisAngle(arm, twistAngle);
+  return twist.multiply(normalAlignment).normalize();
+};
+
+/** D mode maps the strict Gram-Schmidt basis directly into Three.js. */
+export const createWristBasisQuaternion = (
+  pose: Pick<WristPose, "armAxis" | "lateralAxis" | "palmNormal">,
+) => {
+  const arm = toThreeVector(pose.armAxis);
+  const lateral = toThreeVector(pose.lateralAxis);
+  const normal = toThreeVector(pose.palmNormal);
+  return new THREE.Quaternion()
+    .setFromRotationMatrix(
+      new THREE.Matrix4().makeBasis(lateral, normal, arm),
+    )
+    .normalize();
+};
+
+export type RotationSmoothingDebug = {
+  errorDegrees: number;
+  alpha: number;
+  enabled: boolean;
+};
+
+/** Optional D-mode quaternion layer. OFF is an exact target-quaternion copy. */
+export class AdaptiveBasisRotationSmoother {
+  private readonly quaternion = new THREE.Quaternion();
+  private initialized = false;
+
+  update(targetQuaternion: THREE.Quaternion, enabled: boolean) {
+    if (!this.initialized) {
+      this.quaternion.copy(targetQuaternion);
+      this.initialized = true;
+      return {
+        quaternion: this.quaternion,
+        debug: { errorDegrees: 0, alpha: 1, enabled },
+      };
+    }
+
+    const angle = this.quaternion.angleTo(targetQuaternion);
+    const alpha = enabled
+      ? clamp(
+          basisRotationMinAlpha + angle * basisRotationResponseGain,
+          basisRotationMinAlpha,
+          basisRotationMaxAlpha,
+        )
+      : 1;
+
+    if (enabled) {
+      this.quaternion.slerp(targetQuaternion, alpha).normalize();
+    } else {
+      this.quaternion.copy(targetQuaternion);
+    }
+
+    return {
+      quaternion: this.quaternion,
+      debug: {
+        errorDegrees: (angle * 180) / Math.PI,
+        alpha,
+        enabled,
+      },
+    };
+  }
+
+  reset() {
+    this.quaternion.identity();
+    this.initialized = false;
+  }
+}
 
 export const calculateOrientationConfidence = (
   pose: Pick<WristPose, "palmWidth" | "palmLength">,
@@ -52,6 +160,18 @@ export const calculateOrientationConfidence = (
   );
   return normalized * normalized * (3 - 2 * normalized);
 };
+
+export const calculateTwistConfidence = (
+  pose: Pick<
+    WristPose,
+    "palmWidth" | "palmLength" | "twistConfidence"
+  >,
+) =>
+  clamp(
+    pose.twistConfidence ?? calculateOrientationConfidence(pose),
+    0,
+    1,
+  );
 
 export class BraceletOrientationSmoother {
   private readonly quaternion = new THREE.Quaternion();
@@ -85,7 +205,6 @@ export class BraceletOrientationSmoother {
     }
     heldRight.normalize();
     const heldUp = new THREE.Vector3().crossVectors(arm, heldRight).normalize();
-
     const targetRight = localRightAxis
       .clone()
       .applyQuaternion(targetQuaternion);
@@ -140,6 +259,10 @@ export const calculateBraceletAutoFitScale = (
   return desiredInnerDiameter / braceletInnerDiameter;
 };
 
+export const calculateScreenSpaceBraceletScale = (diameter: number) =>
+  (Math.max(diameter, 0.001) * normalizedPoseUnitsToSceneUnits) /
+  braceletOuterDiameter;
+
 export class ThreeTryOnRenderer {
   private readonly scene = new THREE.Scene();
   private readonly camera = new THREE.OrthographicCamera(
@@ -158,6 +281,8 @@ export class ThreeTryOnRenderer {
   private readonly gemMaterial: THREE.MeshPhysicalMaterial;
   private readonly gemMeshes: THREE.Mesh[] = [];
   private readonly orientationSmoother = new BraceletOrientationSmoother();
+  private readonly basisRotationSmoother =
+    new AdaptiveBasisRotationSmoother();
   private braceletFitRatio = 1.06;
   private braceletAspectRatio = 0.76;
   private wristProxyWidthRatio = 0.88;
@@ -166,6 +291,8 @@ export class ThreeTryOnRenderer {
   private minimumScale = 0.08;
   private maximumScale = 0.75;
   private manualScale = 0.22;
+  private renderedRingNormal: Vector3 | null = null;
+  private basisRotationDebug: RotationSmoothingDebug | null = null;
   private width = 1;
   private height = 1;
 
@@ -339,23 +466,31 @@ export class ThreeTryOnRenderer {
       this.proxyGroup.visible = false;
       this.braceletGroup.visible = false;
       this.orientationSmoother.reset();
+      this.renderedRingNormal = null;
       this.renderer.render(this.scene, this.camera);
       return;
     }
 
     const aspect = this.width / this.height;
     const right = toThreeVector(pose.lateralAxis);
-    const up = toThreeVector(pose.palmNormal);
     const arm = toThreeVector(pose.armAxis);
-    const basis = new THREE.Matrix4().makeBasis(right, up, arm);
-    const targetQuaternion = new THREE.Quaternion().setFromRotationMatrix(basis);
+    const targetQuaternion = createBraceletOrientationQuaternion(arm, right);
     const quaternion = this.orientationSmoother.update(
       targetQuaternion,
       arm,
-      calculateOrientationConfidence(pose),
+      calculateTwistConfidence(pose),
       timestamp,
       this.rotationSmoothingEnabled,
     );
+    const renderedRingNormal = localRingNormal
+      .clone()
+      .applyQuaternion(quaternion)
+      .normalize();
+    this.renderedRingNormal = {
+      x: renderedRingNormal.x,
+      y: renderedRingNormal.y,
+      z: renderedRingNormal.z,
+    };
     // Palm length follows the forearm axis and stays usable while the hand
     // rolls edge-on; transverse palm width would shrink the whole bracelet.
     const screenScale =
@@ -416,15 +551,169 @@ export class ThreeTryOnRenderer {
     this.renderer.render(this.scene, this.camera);
   }
 
+  /**
+   * C mode: the final projection is driven only by the screen-space wrist
+   * cross-section. No 3D wrist quaternion or physics offset is applied here.
+   */
+  renderScreenSpace(
+    fit: ScreenSpaceWristFit | null,
+    pose: WristPose | null,
+    opacity: number,
+  ) {
+    if (!fit || !pose || pose.confidence < 0.35) {
+      this.proxyGroup.visible = false;
+      this.braceletGroup.visible = false;
+      this.renderedRingNormal = null;
+      this.renderer.render(this.scene, this.camera);
+      return;
+    }
+
+    const aspect = this.width / this.height;
+    const braceletScale = calculateScreenSpaceBraceletScale(fit.diameter);
+    const position = new THREE.Vector3(
+      (fit.center.x - 0.5) * 2 * aspect,
+      (0.5 - fit.center.y) * 2,
+      clamp(-pose.depth * 1.4, -0.34, 0.34),
+    );
+    const screenQuaternion = new THREE.Quaternion().setFromAxisAngle(
+      localRingNormal,
+      -fit.angle,
+    );
+
+    this.renderedRingNormal = null;
+    this.proxyGroup.visible = true;
+    this.proxyGroup.position.copy(position);
+    this.proxyGroup.quaternion.copy(screenQuaternion);
+    const wristProxyWidth = braceletScale * this.wristProxyWidthRatio;
+    this.proxyGroup.scale.set(
+      wristProxyWidth,
+      wristProxyWidth * this.braceletAspectRatio,
+      braceletScale * 1.1,
+    );
+
+    this.braceletGroup.visible = true;
+    this.braceletGroup.position.copy(position);
+    this.braceletGroup.quaternion.copy(screenQuaternion);
+    this.braceletGroup.scale.set(
+      braceletScale,
+      braceletScale * this.braceletAspectRatio,
+      braceletScale,
+    );
+    this.visualGroup.rotation.set(0, 0, 0);
+    this.visualGroup.traverse((object) => {
+      if (object instanceof THREE.Mesh && object.material) {
+        const material = object.material as THREE.Material & {
+          opacity?: number;
+        };
+        if ("opacity" in material) material.opacity = opacity;
+      }
+    });
+
+    this.renderer.render(this.scene, this.camera);
+  }
+
+  /**
+   * D mode: preserve the full orthogonal 3D basis, depth, and occlusion. The
+   * bracelet and proxy intentionally receive the exact same quaternion.
+   */
+  renderBasis(
+    pose: WristPose | null,
+    opacity: number,
+    rotationSmoothingEnabled = false,
+  ) {
+    if (!pose || pose.confidence < 0.35) {
+      this.proxyGroup.visible = false;
+      this.braceletGroup.visible = false;
+      this.basisRotationSmoother.reset();
+      this.basisRotationDebug = null;
+      this.renderedRingNormal = null;
+      this.renderer.render(this.scene, this.camera);
+      return;
+    }
+
+    const aspect = this.width / this.height;
+    const targetQuaternion = createWristBasisQuaternion(pose);
+    const rotation = this.basisRotationSmoother.update(
+      targetQuaternion,
+      rotationSmoothingEnabled,
+    );
+    const quaternion = rotation.quaternion;
+    this.basisRotationDebug = rotation.debug;
+    const renderedRingNormal = localRingNormal
+      .clone()
+      .applyQuaternion(quaternion)
+      .normalize();
+    this.renderedRingNormal = {
+      x: renderedRingNormal.x,
+      y: renderedRingNormal.y,
+      z: renderedRingNormal.z,
+    };
+    const braceletScale = clamp(
+      this.autoFitEnabled
+        ? calculateBraceletAutoFitScale(
+            pose.wristWidth,
+            this.braceletFitRatio,
+          )
+        : this.manualScale,
+      this.minimumScale,
+      this.maximumScale,
+    );
+    const position = new THREE.Vector3(
+      (pose.x - 0.5) * 2 * aspect,
+      (0.5 - pose.y) * 2,
+      clamp(-pose.depth * 1.4, -0.34, 0.34),
+    );
+
+    this.proxyGroup.visible = true;
+    this.proxyGroup.position.copy(position);
+    this.proxyGroup.quaternion.copy(quaternion);
+    const wristProxyWidth = braceletScale * this.wristProxyWidthRatio;
+    this.proxyGroup.scale.set(
+      wristProxyWidth,
+      wristProxyWidth * this.braceletAspectRatio,
+      braceletScale * 1.1,
+    );
+
+    this.braceletGroup.visible = true;
+    this.braceletGroup.position.copy(position);
+    this.braceletGroup.quaternion.copy(quaternion);
+    this.braceletGroup.scale.setScalar(braceletScale);
+    this.visualGroup.rotation.set(0, 0, 0);
+    this.visualGroup.traverse((object) => {
+      if (object instanceof THREE.Mesh && object.material) {
+        const material = object.material as THREE.Material & {
+          opacity?: number;
+        };
+        if ("opacity" in material) material.opacity = opacity;
+      }
+    });
+
+    this.renderer.render(this.scene, this.camera);
+  }
+
   clear() {
     this.proxyGroup.visible = false;
     this.braceletGroup.visible = false;
     this.orientationSmoother.reset();
+    this.basisRotationSmoother.reset();
+    this.basisRotationDebug = null;
+    this.renderedRingNormal = null;
     this.renderer.render(this.scene, this.camera);
   }
 
   getCanvas() {
     return this.renderer.domElement;
+  }
+
+  getOrientationDebug() {
+    return this.renderedRingNormal
+      ? {
+          ringNormal: { ...this.renderedRingNormal },
+          rotation: this.basisRotationDebug
+            ? { ...this.basisRotationDebug }
+            : null,
+        }
+      : null;
   }
 
   dispose() {
